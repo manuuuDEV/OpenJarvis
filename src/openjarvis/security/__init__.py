@@ -48,7 +48,12 @@ def setup_security(
             scanners.append(PIIScanner())
 
         if scanners:
-            mode = RedactionMode(config.security.mode)
+            mode_name = config.security.mode
+            # A cloud provider is an external trust boundary. Blocking is safer
+            # than forwarding a partially transformed secret or PII value.
+            if getattr(config, "privacy", None) and config.privacy.mode != "local_only":
+                mode_name = "block"
+            mode = RedactionMode(mode_name)
             engine = GuardrailsEngine(
                 engine,
                 scanners=scanners,

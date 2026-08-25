@@ -23,6 +23,7 @@ from openjarvis.engine._base import (
     messages_to_dicts,
 )
 from openjarvis.engine._stubs import StreamChunk
+from openjarvis.security.privacy import PrivacyPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,24 @@ def _is_openai_model(model: str) -> bool:
     if m in (name.lower() for name in _OPENAI_MODELS):
         return True
     return m.startswith(_OPENAI_PREFIXES)
+
+
+def _provider_for_model(model: str) -> str:
+    """Return the provider that will receive *model*'s prompt."""
+
+    if _is_codex_model(model):
+        return "codex"
+    if _is_openrouter_model(model):
+        return "openrouter"
+    if _is_minimax_model(model):
+        return "minimax"
+    if _is_deepseek_model(model):
+        return "deepseek"
+    if _is_anthropic_model(model):
+        return "anthropic"
+    if _is_google_model(model):
+        return "google"
+    return "openai"
 
 
 def _is_openai_reasoning_model(model: str) -> bool:
@@ -327,7 +346,10 @@ class CloudEngine(InferenceEngine):
     engine_id = "cloud"
     is_cloud = True
 
-    def __init__(self) -> None:
+    def __init__(self, *, privacy: PrivacyPolicy | None = None) -> None:
+        # A cloud engine is fail-closed unless configuration explicitly permits
+        # the provider selected for a request.
+        self._privacy = privacy or PrivacyPolicy()
         self._openai_client: Any = None
         self._anthropic_client: Any = None
         self._google_client: Any = None
@@ -412,6 +434,11 @@ class CloudEngine(InferenceEngine):
                 "token": codex_token,
                 "url": codex_url,
             }
+
+    def _require_provider_consent(self, model: str) -> None:
+        """Block a request before its prompt leaves the device."""
+
+        self._privacy.require_provider(_provider_for_model(model))
 
     def _prepare_anthropic_messages(
         self,
@@ -1109,6 +1136,7 @@ class CloudEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        self._require_provider_consent(model)
         kw = dict(
             model=model,
             temperature=temperature,
@@ -1138,6 +1166,7 @@ class CloudEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
+        self._require_provider_consent(model)
         kw = dict(
             model=model,
             temperature=temperature,
@@ -1755,6 +1784,7 @@ class CloudEngine(InferenceEngine):
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """Yield StreamChunks with content, tool_calls, and finish_reason."""
+        self._require_provider_consent(model)
         kw = dict(
             model=model,
             temperature=temperature,
@@ -1772,20 +1802,22 @@ class CloudEngine(InferenceEngine):
                 yield chunk
 
     def list_models(self) -> List[str]:
+        """List only models whose provider was explicitly approved."""
+
         models: List[str] = []
-        if self._openai_client is not None:
+        if self._openai_client is not None and self._privacy.allows_external_provider("openai"):
             models.extend(_OPENAI_MODELS)
-        if self._anthropic_client is not None:
+        if self._anthropic_client is not None and self._privacy.allows_external_provider("anthropic"):
             models.extend(_ANTHROPIC_MODELS)
-        if self._google_client is not None:
+        if self._google_client is not None and self._privacy.allows_external_provider("google"):
             models.extend(_GOOGLE_MODELS)
-        if self._openrouter_client is not None:
+        if self._openrouter_client is not None and self._privacy.allows_external_provider("openrouter"):
             models.extend(_OPENROUTER_POPULAR)
-        if self._minimax_client is not None:
+        if self._minimax_client is not None and self._privacy.allows_external_provider("minimax"):
             models.extend(_MINIMAX_MODELS)
-        if self._deepseek_client is not None:
+        if self._deepseek_client is not None and self._privacy.allows_external_provider("deepseek"):
             models.extend(_DEEPSEEK_MODELS)
-        if self._codex_client is not None:
+        if self._codex_client is not None and self._privacy.allows_external_provider("codex"):
             models.extend(_CODEX_MODELS)
         return models
 
@@ -1829,18 +1861,13 @@ class CloudEngine(InferenceEngine):
         instead of the user getting a helpful "start your local engine"
         message (see #532).
         """
-        return self._client_for_model(model) is not None
+        return (
+            self._privacy.allows_external_provider(_provider_for_model(model))
+            and self._client_for_model(model) is not None
+        )
 
     def health(self) -> bool:
-        return (
-            self._openai_client is not None
-            or self._anthropic_client is not None
-            or self._google_client is not None
-            or self._openrouter_client is not None
-            or self._minimax_client is not None
-            or self._deepseek_client is not None
-            or self._codex_client is not None
-        )
+        return bool(self.list_models())
 
     def close(self) -> None:
         if self._openai_client is not None:
@@ -1865,4 +1892,10 @@ class CloudEngine(InferenceEngine):
             self._codex_client = None
 
 
-__all__ = ["CloudEngine", "PRICING", "_annotate_anthropic_cache", "estimate_cost"]
+__all__ = [
+    "CloudEngine",
+    "PRICING",
+    "_annotate_anthropic_cache",
+    "_provider_for_model",
+    "estimate_cost",
+]

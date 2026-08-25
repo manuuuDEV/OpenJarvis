@@ -967,7 +967,8 @@ MemoryConfig = StorageConfig
 class MCPConfig:
     """MCP (Model Context Protocol) settings."""
 
-    enabled: bool = True
+    # MCP servers can execute code or access remote accounts. Keep them opt-in.
+    enabled: bool = False
     servers: str = ""  # JSON list of MCP server configs
 
 
@@ -1183,12 +1184,31 @@ class AnalyticsConfig:
     or hardware identifiers are ever sent. See ``docs/telemetry.md``.
     """
 
-    enabled: bool = True
+    # External analytics are opt-in. Local telemetry is controlled separately.
+    enabled: bool = False
     host: str = "https://34.231.106.201.sslip.io"
     key: str = "phc_ysKu72QaxzYNmDpHFcesD2ZZAe68zkdWJEKoYYkc5e3n"
     anon_id_path: str = field(default_factory=lambda: str(get_config_dir() / "anon_id"))
     flush_interval_seconds: int = 30
     flush_at_size: int = 100
+
+
+@dataclass(slots=True)
+class PrivacyConfig:
+    """Outbound inference privacy boundary.
+
+    ``local_only`` blocks any provider endpoint outside loopback. To use a
+    standard cloud API, choose ``explicit_external`` and list the provider in
+    ``approved_external_providers``. TLS protects the transport but the chosen
+    provider necessarily processes plaintext prompts and completions.
+
+    ``confidential_compute`` is fail-closed until OpenJarvis can verify remote
+    attestation and bind request keys to a supported confidential runtime.
+    """
+
+    mode: str = "local_only"
+    approved_external_providers: str = ""
+    require_tls: bool = True
 
 
 @dataclass(slots=True)
@@ -1713,6 +1733,7 @@ class JarvisConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     analytics: AnalyticsConfig = field(default_factory=AnalyticsConfig)
+    privacy: PrivacyConfig = field(default_factory=PrivacyConfig)
     traces: TracesConfig = field(default_factory=TracesConfig)
     channel: ChannelConfig = field(default_factory=ChannelConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
@@ -2011,6 +2032,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "server",
             "telemetry",
             "analytics",
+            "privacy",
             "traces",
             "security",
             "channel",
@@ -2058,6 +2080,11 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
     if not config_path.exists() and cfg.security.profile:
         apply_security_profile(cfg.security, cfg.server)
 
+    # Fail during configuration load rather than after a provider was selected.
+    # The module is dependency-light and does not perform any network activity.
+    from openjarvis.security.privacy import PrivacyPolicy
+
+    PrivacyPolicy.from_config(cfg)
     return cfg
 
 
@@ -2098,8 +2125,21 @@ default_model = "{model}"
 [agent]
 default_agent = "simple"
 
+[privacy]
+# local_only blocks all non-loopback inference endpoints.
+# Set explicit_external and allowlist only the provider you intentionally use.
+mode = "local_only"
+approved_external_providers = ""
+require_tls = true
+
+[analytics]
+# External analytics are always opt-in.
+enabled = false
+
 [tools]
-enabled = ["code_interpreter", "web_search", "file_read", "shell_exec"]
+# Tools can expose local files, browsers, shells, or external accounts. Opt in
+# only to the exact tools needed for a trusted task.
+enabled = []
 """
 
 
@@ -2126,6 +2166,19 @@ def generate_default_toml(
 
 [engine]
 default = "{engine}"
+
+[privacy]
+# local_only blocks non-loopback inference endpoints. A normal cloud API
+# receives plaintext inside the chosen provider's inference boundary.
+# To use one, set mode = "explicit_external" and list only its provider:
+# approved_external_providers = "openai"  # or anthropic, google, etc.
+mode = "local_only"
+approved_external_providers = ""
+require_tls = true
+
+[analytics]
+# External product analytics are opt-in.
+enabled = false
 
 [engine.ollama]
 host = "http://localhost:11434"
@@ -2200,7 +2253,8 @@ extraction_model = ""         # model for fact extraction ("" = active model)
 max_facts = 1000              # cap on stored facts
 
 [tools.mcp]
-enabled = true
+# MCP servers can access accounts or execute external code; opt in explicitly.
+enabled = false
 
 # [tools.browser]
 # headless = true

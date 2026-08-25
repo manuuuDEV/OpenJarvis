@@ -26,6 +26,19 @@ from openjarvis.mining._constants import (
 
 CONTAINER_NAME = "openjarvis-pearl-miner"
 LOCAL_MODEL_BIND_PATH = "/models/openjarvis-local-pearl-model"
+_MINING_OPT_IN_ENV = "OPENJARVIS_ENABLE_MINING"
+
+
+def _require_mining_opt_in() -> None:
+    """Keep an experimental, privileged subsystem disabled by default."""
+
+    if os.environ.get(_MINING_OPT_IN_ENV) != "1":
+        raise ConfigurationError(
+            "Mining is disabled by default. It can build/run untrusted GPU "
+            "workloads and is not part of the privacy profile. Set "
+            "OPENJARVIS_ENABLE_MINING=1 only after independently reviewing "
+            "the image, network settings, and wallet configuration."
+        )
 
 _SECRET_LOG_PATTERNS = (
     (re.compile(r"(rpc_password:\s*)\S+", re.IGNORECASE), r"\1[REDACTED]"),
@@ -86,36 +99,19 @@ class PearlDockerLauncher:
         3. ``tag`` matches OJ's default → clone Pearl + ``docker build``.
         4. Otherwise → ``ImageAcquisitionError``.
         """
-        image_not_found, not_found, api_error = _docker_error_types()
+        _require_mining_opt_in()
+        image_not_found, _, _ = _docker_error_types()
 
         try:
             self._client.images.get(tag)
             return tag
-        except image_not_found:
-            pass
-
-        pull_error: str | None = None
-        try:
-            self._client.images.pull(tag)
-            return tag
-        except (not_found, api_error) as exc:
-            # Capture for context in the eventual ImageAcquisitionError below;
-            # we still fall through to the build path for the OJ default tag.
-            msg = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
-            pull_error = msg
-
-        if tag == PEARL_IMAGE_TAG:
-            cache = self._clone_pearl_repo()
-            return self._docker_build(cache, tag)
-
-        raise ImageAcquisitionError(
-            f"image {tag!r} not present locally, not pullable, and not OJ's "
-            f"default tag (no build fallback). Pull error: {pull_error}. "
-            f"Either build it manually with "
-            f"`docker buildx build -t {tag} -f miner/vllm-miner/Dockerfile .` "
-            f"from the Pearl repo, or set [mining.extra].docker_image_tag to "
-            f"the OJ default ({PEARL_IMAGE_TAG}) to enable the build fallback."
-        )
+        except image_not_found as exc:
+            raise ImageAcquisitionError(
+                f"Verified local image {tag!r} is required. OpenJarvis never "
+                "pulls, clones, patches, or builds mining images automatically. "
+                "Build and verify an immutable image outside OpenJarvis, then "
+                "load it into the local Docker daemon before opting in."
+            ) from exc
 
     def _clone_pearl_repo(self) -> Path:
         """Sync the Pearl source cache to ``PEARL_PINNED_REF``.
@@ -254,6 +250,7 @@ class PearlDockerLauncher:
         ``image`` must already be resolved by ``ensure_image()``.
         Returns the docker.models.containers.Container object.
         """
+        _require_mining_opt_in()
         extra = config.extra
         # Resolve secret env vars (we hold the *name*, not the value).
         password_env = extra.get("pearld_rpc_password_env", "PEARLD_RPC_PASSWORD")
@@ -326,19 +323,25 @@ class PearlDockerLauncher:
             environment["NVIDIA_VISIBLE_DEVICES"] = ",".join(device_ids)
 
         # Dynamic import so tests don't need the real `docker` package shape.
+        if not device_ids:
+            raise ConfigurationError(
+                "[mining.extra].cuda_visible_devices must name explicit GPU IDs; "
+                "OpenJarvis will not expose every host GPU by default."
+            )
         try:
             from docker.types import DeviceRequest
 
-            if device_ids:
-                device_requests = [
-                    DeviceRequest(device_ids=device_ids, capabilities=[["gpu"]])
-                ]
-            else:
-                device_requests = [DeviceRequest(count=-1, capabilities=[["gpu"]])]
+            device_requests = [
+                DeviceRequest(device_ids=device_ids, capabilities=[["gpu"]])
+            ]
         except ImportError:  # pragma: no cover
             device_requests = None
 
-        hf_cache = Path.home() / ".cache" / "huggingface"
+        # Use a private OpenJarvis cache rather than a writable mount of the
+        # user's global Hugging Face credentials and cache directory.
+        hf_cache = PEARL_CACHE_DIR / "hf-cache"
+        hf_cache.mkdir(parents=True, exist_ok=True)
+        hf_cache.chmod(0o700)
         volumes = {
             str(hf_cache): {"bind": "/root/.cache/huggingface", "mode": "rw"},
         }
@@ -347,6 +350,13 @@ class PearlDockerLauncher:
                 "bind": LOCAL_MODEL_BIND_PATH,
                 "mode": "ro",
             }
+
+        network_mode = str(extra.get("network_mode", "none")).strip().lower()
+        if network_mode not in {"none", "bridge"}:
+            raise ConfigurationError(
+                "[mining.extra].network_mode may only be 'none' or 'bridge'; "
+                "host networking is prohibited."
+            )
 
         # Sanitize wrap so an APIError from the daemon doesn't surface the
         # full container spec (which contains the resolved password) in a
@@ -358,11 +368,11 @@ class PearlDockerLauncher:
                 command=command,
                 name=CONTAINER_NAME,
                 detach=True,
-                auto_remove=False,
-                restart_policy={"Name": "unless-stopped"},
+                auto_remove=True,
+                restart_policy={"Name": "no"},
                 device_requests=device_requests,
                 shm_size="8g",
-                network_mode="host",
+                network_mode=network_mode,
                 volumes=volumes,
                 environment=environment,
             )

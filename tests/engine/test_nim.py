@@ -11,13 +11,26 @@ import pytest
 from openjarvis.core.types import Message, Role
 from openjarvis.engine._base import EngineConnectionError
 from openjarvis.engine.nim import NIMEngine
+from openjarvis.security.privacy import PrivacyPolicy, PrivacyPolicyError
 
 _HOST = "https://nim.test"
 _CHAT_URL = f"{_HOST}/v1/chat/completions"
+TEST_NIM_POLICY = PrivacyPolicy(
+    mode="explicit_external", approved_external_providers=("nim",)
+)
 
 
 def _message() -> list[Message]:
     return [Message(role=Role.USER, content="Hello")]
+
+
+def test_default_policy_blocks_external_nim_before_request(respx_mock) -> None:
+    route = respx_mock.post(_CHAT_URL).mock(return_value=httpx.Response(200))
+    engine = NIMEngine(host=_HOST)
+    with pytest.raises(PrivacyPolicyError):
+        engine.generate(_message(), model="nim-model")
+    assert route.call_count == 0
+    engine.close()
 
 
 def test_generate_preserves_tools_on_unsupported_request(respx_mock) -> None:
@@ -25,7 +38,7 @@ def test_generate_preserves_tools_on_unsupported_request(respx_mock) -> None:
     route = respx_mock.post(_CHAT_URL).mock(
         return_value=httpx.Response(400, json={"detail": "tools unsupported"})
     )
-    engine = NIMEngine(host=_HOST)
+    engine = NIMEngine(host=_HOST, privacy=TEST_NIM_POLICY)
 
     with pytest.raises(httpx.HTTPStatusError):
         engine.generate(
@@ -52,7 +65,7 @@ async def test_stream_uses_async_http_and_sends_auth(respx_mock, monkeypatch) ->
         ]
     )
     route = respx_mock.post(_CHAT_URL).mock(return_value=httpx.Response(200, text=body))
-    engine = NIMEngine(host=_HOST)
+    engine = NIMEngine(host=_HOST, privacy=TEST_NIM_POLICY)
     engine._client.stream = MagicMock(  # type: ignore[method-assign]
         side_effect=AssertionError("sync client used from async stream")
     )
@@ -100,7 +113,7 @@ async def test_stream_full_parses_tool_and_usage_chunks(respx_mock) -> None:
         ]
     )
     respx_mock.post(_CHAT_URL).mock(return_value=httpx.Response(200, text=body))
-    engine = NIMEngine(host=_HOST)
+    engine = NIMEngine(host=_HOST, privacy=TEST_NIM_POLICY)
 
     chunks = [
         chunk async for chunk in engine.stream_full(_message(), model="nim-model")
@@ -115,7 +128,7 @@ async def test_stream_full_parses_tool_and_usage_chunks(respx_mock) -> None:
 
 def test_generate_maps_connection_errors(respx_mock) -> None:
     respx_mock.post(_CHAT_URL).mock(side_effect=httpx.ConnectError("offline"))
-    engine = NIMEngine(host=_HOST)
+    engine = NIMEngine(host=_HOST, privacy=TEST_NIM_POLICY)
 
     with pytest.raises(EngineConnectionError, match="not reachable"):
         engine.generate(_message(), model="nim-model")
@@ -128,7 +141,7 @@ def test_health_falls_back_to_models(respx_mock) -> None:
     models = respx_mock.get(f"{_HOST}/v1/models").mock(
         return_value=httpx.Response(200, json={"data": []})
     )
-    engine = NIMEngine(host=_HOST)
+    engine = NIMEngine(host=_HOST, privacy=TEST_NIM_POLICY)
 
     assert engine.health() is True
     assert models.called

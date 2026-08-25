@@ -19,6 +19,7 @@ from openjarvis.engine._base import (
     messages_to_dicts,
 )
 from openjarvis.engine._stubs import StreamChunk
+from openjarvis.security.privacy import PrivacyPolicy, PrivacyPolicyError
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,14 @@ class NIMEngine(InferenceEngine):
     _default_host = "https://integrate.api.nvidia.com"
     _api_prefix = "/v1"
 
-    def __init__(self, host: str | None = None, *, timeout: float = 600.0) -> None:
+    def __init__(
+        self,
+        host: str | None = None,
+        *,
+        timeout: float = 600.0,
+        privacy: PrivacyPolicy | None = None,
+    ) -> None:
+        self._privacy = privacy or PrivacyPolicy()
         env_host = os.environ.get("NIM_HOST")
         self._host = (host or env_host or self._default_host).rstrip("/")
 
@@ -53,6 +61,11 @@ class NIMEngine(InferenceEngine):
             headers=headers,
         )
 
+    def _require_privacy_consent(self) -> None:
+        """Block an external NIM endpoint before it receives any request."""
+
+        self._privacy.require_endpoint("nim", self._host)
+
     def _get_headers(self) -> Dict[str, str]:
         """Get headers for requests, including auth if configured."""
         headers = {}
@@ -69,6 +82,7 @@ class NIMEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        self._require_privacy_consent()
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages_to_dicts(messages),
@@ -134,6 +148,7 @@ class NIMEngine(InferenceEngine):
         max_tokens: int = 1024,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
+        self._require_privacy_consent()
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages_to_dicts(messages),
@@ -185,6 +200,7 @@ class NIMEngine(InferenceEngine):
         **kwargs: Any,
     ) -> AsyncIterator["StreamChunk"]:
         """Yield StreamChunks with content, tool_calls, and finish_reason."""
+        self._require_privacy_consent()
         msg_dicts = messages_to_dicts(messages)
         payload: Dict[str, Any] = {
             "model": model,
@@ -239,6 +255,10 @@ class NIMEngine(InferenceEngine):
 
     def list_models(self) -> List[str]:
         try:
+            self._require_privacy_consent()
+        except PrivacyPolicyError:
+            return []
+        try:
             resp = self._client.get(
                 f"{self._api_prefix}/models",
                 headers=self._get_headers(),
@@ -255,6 +275,10 @@ class NIMEngine(InferenceEngine):
         return [m["id"] for m in data.get("data", [])]
 
     def health(self) -> bool:
+        try:
+            self._require_privacy_consent()
+        except PrivacyPolicyError:
+            return False
         try:
             resp = self._client.get(
                 f"{self._api_prefix}/health/ready",

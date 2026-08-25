@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
-# install.sh — OpenJarvis curl-pipe-bash installer.
+# install.sh — OpenJarvis source installer.
 #
-# Usage:
-#   curl -fsSL https://open-jarvis.github.io/OpenJarvis/install.sh | bash
+# SECURITY: do not pipe a mutable remote script into a shell. Clone a reviewed
+# repository commit, inspect this script, then run it locally with a pinned
+# OPENJARVIS_REF commit SHA.
 #
-# Flags (only used in tests / power users):
-#   --no-bg-orchestrator   Skip the detached background orchestrator
-#   --minimal              Skip foreground model pull (no `qwen3.5:2b`)
+# Flags:
+#   --with-ollama          Explicitly enable local Ollama install/start/model pull
+#   --enable-background    Explicitly enable the detached background orchestrator
 #   --force                Re-run all steps even if state file says done
 #
 # Environment overrides:
 #   OPENJARVIS_HOME        Install dir (default: $HOME/.openjarvis)
 #   OPENJARVIS_REPO_URL    git repo URL (default: https://github.com/open-jarvis/OpenJarvis.git)
+#   OPENJARVIS_REF         Required immutable 40- or 64-character commit SHA
+#   OPENJARVIS_ENABLE_ANALYTICS=1  Explicit opt-in for installer analytics
 #   OPENJARVIS_FORCE_WSL   Set 1 to force WSL detection (testing)
 
 set -euo pipefail
 
 # ---- args ----
-SKIP_BG=0
-MINIMAL=0
+ENABLE_BG=0
+INSTALL_OLLAMA=0
 FORCE=0
 for arg in "$@"; do
     case "$arg" in
-        --no-bg-orchestrator) SKIP_BG=1 ;;
-        --minimal) MINIMAL=1 ;;
+        --with-ollama) INSTALL_OLLAMA=1 ;;
+        --enable-background) ENABLE_BG=1 ;;
         --force) FORCE=1 ;;
         *) echo "install.sh: unknown arg: $arg" >&2; exit 2 ;;
     esac
@@ -220,6 +223,7 @@ fi
 # the root is ~/.openjarvis, so existing installs are untouched.
 OPENJARVIS_HOME="${OPENJARVIS_HOME:-$HOME/.openjarvis}"
 OPENJARVIS_REPO_URL="${OPENJARVIS_REPO_URL:-https://github.com/open-jarvis/OpenJarvis.git}"
+OPENJARVIS_REF="${OPENJARVIS_REF:-}"
 SRC_DIR="$OPENJARVIS_HOME/src"
 VENV_DIR="$OPENJARVIS_HOME/.venv"
 STATE_DIR="$OPENJARVIS_HOME/.state"
@@ -250,7 +254,9 @@ INSTALL_START_EPOCH="$(date +%s)"
 CURRENT_STAGE=""
 
 analytics_enabled() {
-    return 0
+    # Installer telemetry is strictly opt-in. No identifier is generated and no
+    # request is attempted unless the user set this exact value.
+    [[ "${OPENJARVIS_ENABLE_ANALYTICS:-0}" == "1" ]]
 }
 
 detect_os() {
@@ -437,10 +443,14 @@ install_uv() {
         echo "    uv already installed"
         return 0
     fi
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    if ! command -v uv >/dev/null 2>&1; then
-        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    fi
+    cat >&2 <<'EOF'
+install.sh: uv is required but is not installed.
+
+For supply-chain safety this installer never executes a remote script with
+curl | sh. Install a reviewed, version-pinned uv release yourself, verify its
+publisher checksum/signature, then re-run this local installer.
+EOF
+    return 1
 }
 
 clone_repo() {
@@ -448,7 +458,18 @@ clone_repo() {
         echo "    repo already at $SRC_DIR"
         return 0
     fi
-    git clone --depth 1 "$OPENJARVIS_REPO_URL" "$SRC_DIR"
+    if [[ ! "$OPENJARVIS_REF" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]]; then
+        cat >&2 <<'EOF'
+install.sh: OPENJARVIS_REF must be an immutable 40- or 64-character commit SHA.
+
+Refusing to install from a mutable branch or tag. Example:
+  OPENJARVIS_REF=<reviewed-commit-sha> ./scripts/install/install.sh
+EOF
+        return 1
+    fi
+    git clone --no-checkout "$OPENJARVIS_REPO_URL" "$SRC_DIR"
+    git -C "$SRC_DIR" fetch --depth 1 origin "$OPENJARVIS_REF"
+    git -C "$SRC_DIR" checkout --detach "$OPENJARVIS_REF"
 }
 
 copy_scripts() {
@@ -535,14 +556,26 @@ editable_install() {
 }
 
 install_ollama() {
+    if [[ "$INSTALL_OLLAMA" -ne 1 ]]; then
+        echo "    --with-ollama not set; skipping Ollama installation"
+        return 0
+    fi
     if command -v ollama >/dev/null 2>&1; then
         echo "    ollama already installed"
         return 0
     fi
-    curl -fsSL https://ollama.com/install.sh | sh
+    cat >&2 <<'EOF'
+install.sh: install Ollama manually from a reviewed, version-pinned release and
+verify its checksum/signature. This installer does not execute ollama.com/install.sh.
+EOF
+    return 1
 }
 
 start_ollama() {
+    if [[ "$INSTALL_OLLAMA" -ne 1 ]]; then
+        echo "    --with-ollama not set; skipping Ollama daemon start"
+        return 0
+    fi
     if pgrep -f "ollama serve" >/dev/null 2>&1; then
         echo "    ollama serve already running"
         wait_for_ollama || true
@@ -583,22 +616,23 @@ wait_for_ollama() {
 MODEL_PULL_OK=0
 
 pull_default_model() {
-    if [[ "$MINIMAL" -eq 1 ]]; then
-        echo "    --minimal set; skipping model pull"
-        MODEL_PULL_OK=1  # nothing to pull → not a failure
+    if [[ "$INSTALL_OLLAMA" -ne 1 ]]; then
+        echo "    --with-ollama not set; skipping model pull"
+        MODEL_PULL_OK=1
         return 0
     fi
     if ollama pull qwen3.5:2b; then
         MODEL_PULL_OK=1
     else
-        echo "    warning: ollama pull failed; bg-orchestrator will retry in the background"
+        echo "    warning: ollama pull failed; retry it manually after reviewing the error."
     fi
 }
 
 write_config() {
+    # The generated config uses local_only privacy and analytics opt-out. It
+    # deliberately does not select or prefer a cloud provider.
     "$VENV_DIR/bin/jarvis" _bootstrap --write-config \
-        --engine ollama --model qwen3.5:2b \
-        --prefer-cloud-when-available
+        --engine ollama --model qwen3.5:2b
 }
 
 install_symlinks() {
@@ -638,8 +672,8 @@ ensure_path() {
 }
 
 detach_bg_orchestrator() {
-    if [[ "$SKIP_BG" -eq 1 ]]; then
-        echo "    --no-bg-orchestrator set; skipping detach"
+    if [[ "$ENABLE_BG" -ne 1 ]]; then
+        echo "    --enable-background not set; skipping background work"
         return 0
     fi
     local models

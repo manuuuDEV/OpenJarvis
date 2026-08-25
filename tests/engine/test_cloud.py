@@ -18,6 +18,23 @@ from openjarvis.engine.cloud import (
     _is_openrouter_model,
     estimate_cost,
 )
+from openjarvis.security.privacy import PrivacyPolicy, PrivacyPolicyError
+
+
+# Unit tests exercise provider SDK routing with an explicit, in-memory consent
+# policy. The production configuration remains local_only by default.
+TEST_CLOUD_POLICY = PrivacyPolicy(
+    mode="explicit_external",
+    approved_external_providers=(
+        "openai",
+        "anthropic",
+        "google",
+        "openrouter",
+        "minimax",
+        "deepseek",
+        "codex",
+    ),
+)
 
 
 class TestEstimateCost:
@@ -34,11 +51,18 @@ class TestEstimateCost:
 
 
 class TestCloudEngineHealth:
+    def test_default_policy_blocks_external_request_before_client_call(self) -> None:
+        engine = CloudEngine()
+        engine._openai_client = mock.MagicMock()
+        with pytest.raises(PrivacyPolicyError):
+            engine.generate([Message(role=Role.USER, content="private")], model="gpt-4o")
+        engine._openai_client.chat.completions.create.assert_not_called()
+
     def test_health_no_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         EngineRegistry.register_value("cloud", CloudEngine)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         assert engine.health() is False
 
     def test_health_with_openai_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -47,7 +71,7 @@ class TestCloudEngineHealth:
         fake_openai = mock.MagicMock()
         with mock.patch.dict("sys.modules", {"openai": fake_openai}):
             EngineRegistry.register_value("cloud", CloudEngine)
-            engine = CloudEngine()
+            engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         assert engine.health() is True
 
 
@@ -56,7 +80,7 @@ class TestCloudEngineListModels:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         EngineRegistry.register_value("cloud", CloudEngine)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         assert engine.list_models() == []
 
 
@@ -80,7 +104,7 @@ class TestCloudEngineGenerate:
         fake_client.chat.completions.create.return_value = fake_resp
 
         EngineRegistry.register_value("cloud", CloudEngine)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._openai_client = fake_client
 
         result = engine.generate(
@@ -106,7 +130,7 @@ class TestCloudEngineGenerate:
         fake_client.messages.create.return_value = fake_resp
 
         EngineRegistry.register_value("cloud", CloudEngine)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._anthropic_client = fake_client
 
         result = engine.generate(
@@ -164,7 +188,7 @@ class TestOpenAIUnsupportedTemperatureRetry:
         fake_client.chat.completions.create.side_effect = create
 
         EngineRegistry.register_value("cloud", CloudEngine)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._openai_client = fake_client
 
         result = engine.generate(
@@ -196,7 +220,7 @@ class TestOpenAIUnsupportedTemperatureRetry:
         fake_client.chat.completions.create.side_effect = create
 
         EngineRegistry.register_value("cloud", CloudEngine)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._openai_client = fake_client
 
         with pytest.raises(Exception):  # noqa: B017 - re-raised unchanged
@@ -230,7 +254,7 @@ class TestCodexClientInit:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("OPENAI_CODEX_API_KEY", "test-token")
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         assert engine.health() is True
         assert engine._codex_client is not None
         assert engine._codex_client["token"] == "test-token"
@@ -241,14 +265,14 @@ class TestCodexClientInit:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("OPENAI_CODEX_API_KEY", "test-token")
         monkeypatch.setenv("OPENAI_CODEX_BASE_URL", "http://localhost:9999")
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         assert engine._codex_client["url"] == "http://localhost:9999/responses"
 
     def test_list_models_includes_codex(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.setenv("OPENAI_CODEX_API_KEY", "test-token")
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         models = engine.list_models()
         assert "codex/gpt-4o" in models
         assert "codex/gpt-5-mini" in models
@@ -258,7 +282,7 @@ class TestCodexClientInit:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_CODEX_API_KEY", raising=False)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         assert engine._codex_client is None
         assert "codex/gpt-4o" not in engine.list_models()
 
@@ -278,7 +302,7 @@ class TestCodexGenerate:
         }
         fake_response.raise_for_status = mock.MagicMock()
 
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._codex_client = {
             "token": "test-token",
             "url": "https://api.openai.com/v1/responses",
@@ -325,7 +349,7 @@ class TestCodexGenerate:
         }
         fake_response.raise_for_status = mock.MagicMock()
 
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._codex_client = {
             "token": "t",
             "url": "https://api.openai.com/v1/responses",
@@ -354,7 +378,7 @@ class TestCodexGenerate:
         }
         fake_response.raise_for_status = mock.MagicMock()
 
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._codex_client = {
             "token": "t",
             "url": "https://api.openai.com/v1/responses",
@@ -381,7 +405,7 @@ class TestCodexGenerate:
     def test_codex_close(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._codex_client = {"token": "t", "url": "http://test"}
         engine.close()
         assert engine._codex_client is None
@@ -416,7 +440,7 @@ class TestOpenRouterToolForwarding:
         fake_client.chat.completions.create.return_value = fake_resp
 
         EngineRegistry.register_value("cloud", CloudEngine)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._openrouter_client = fake_client
 
         tools = [
@@ -455,6 +479,7 @@ class TestCloudEngineCanServe:
     @staticmethod
     def _engine(**clients: object) -> CloudEngine:
         eng = CloudEngine.__new__(CloudEngine)  # bypass real client init
+        eng._privacy = TEST_CLOUD_POLICY
         for name in (
             "_openai_client",
             "_anthropic_client",
@@ -553,7 +578,7 @@ class TestCloudEngineDeepSeek:
         fake_openai = mock.MagicMock()
         with mock.patch.dict("sys.modules", {"openai": fake_openai}):
             EngineRegistry.register_value("cloud", CloudEngine)
-            engine = CloudEngine()
+            engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
 
         fake_openai.OpenAI.assert_any_call(
             base_url="https://api.deepseek.com/v1",
@@ -571,7 +596,7 @@ class TestCloudEngineDeepSeek:
         fake_openai = mock.MagicMock()
         with mock.patch.dict("sys.modules", {"openai": fake_openai}):
             EngineRegistry.register_value("cloud", CloudEngine)
-            engine = CloudEngine()
+            engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
 
         assert engine.health() is True
         models = engine.list_models()
@@ -602,7 +627,7 @@ class TestCloudEngineDeepSeek:
         fake_client.chat.completions.create.return_value = fake_resp
 
         EngineRegistry.register_value("cloud", CloudEngine)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         engine._deepseek_client = fake_client
 
         result = engine.generate(
@@ -619,7 +644,7 @@ class TestCloudEngineDeepSeek:
         for var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"):
             monkeypatch.delenv(var, raising=False)
         EngineRegistry.register_value("cloud", CloudEngine)
-        engine = CloudEngine()
+        engine = CloudEngine(privacy=TEST_CLOUD_POLICY)
         assert engine._deepseek_client is None
         with pytest.raises(EngineConnectionError):
             engine.generate(

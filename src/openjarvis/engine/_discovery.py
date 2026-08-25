@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Tuple
 
 from openjarvis.core.config import JarvisConfig
 from openjarvis.core.registry import EngineRegistry
 from openjarvis.engine._base import InferenceEngine
+from openjarvis.security.privacy import PrivacyPolicy, PrivacyPolicyError
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +33,47 @@ _HOST_MAP: Dict[str, str | None] = {
 }
 
 
+def _privacy_allows_engine(key: str, config: JarvisConfig) -> bool:
+    """Return whether configuration permits probing *key*.
+
+    The check runs before ``health()`` so discovery never makes a remote request
+    merely because a cloud API key happens to be present in the environment.
+    """
+
+    policy = PrivacyPolicy.from_config(config)
+    if key == "cloud":
+        return policy.has_external_provider_consent
+    if key == "litellm":
+        return policy.allows_external_provider("litellm")
+    if key == "nim":
+        endpoint = os.environ.get("NIM_HOST", "https://integrate.api.nvidia.com")
+        try:
+            policy.require_endpoint("nim", endpoint)
+        except PrivacyPolicyError:
+            return False
+        return True
+
+    host_attr = _HOST_MAP.get(key)
+    if host_attr is None:
+        return True
+    endpoint = getattr(config.engine, host_attr, "")
+    if not endpoint:
+        return True
+    try:
+        policy.require_endpoint(key, endpoint)
+    except PrivacyPolicyError:
+        return False
+    return True
+
+
 def _make_engine(key: str, config: JarvisConfig) -> InferenceEngine:
     """Instantiate a registered engine with the appropriate config host."""
     cls = EngineRegistry.get(key)
+
+    if key == "cloud":
+        return cls(privacy=PrivacyPolicy.from_config(config))
+    if key == "nim":
+        return cls(privacy=PrivacyPolicy.from_config(config))
 
     # LiteLLM cannot enumerate every model supported by every provider.  Its
     # list_models() contract therefore advertises the configured default
@@ -120,7 +160,9 @@ def discover_engines(config: JarvisConfig) -> List[Tuple[str, InferenceEngine]]:
     # threads collapses that to roughly the slowest single probe. The
     # healthy.sort() below normalizes order, so completion order is
     # irrelevant and the result is identical to the serial version (#263).
-    keys = list(EngineRegistry.keys())
+    keys = [
+        key for key in EngineRegistry.keys() if _privacy_allows_engine(key, config)
+    ]
 
     def _probe(key: str) -> Tuple[str, InferenceEngine] | None:
         try:
@@ -187,6 +229,12 @@ def get_engine(
         return engine.health() and (model is None or engine.can_serve(model))
 
     if engine_key:
+        if not _privacy_allows_engine(engine_key, config):
+            logger.warning(
+                "Requested engine %r is blocked by the outbound privacy policy",
+                engine_key,
+            )
+            return None
         if not EngineRegistry.contains(engine_key):
             logger.warning("Requested engine %r is not registered", engine_key)
             return None
@@ -205,7 +253,11 @@ def get_engine(
 
     default_key = config.engine.default
     default_is_cloud: bool | None = None
-    if default_key and EngineRegistry.contains(default_key):
+    if (
+        default_key
+        and EngineRegistry.contains(default_key)
+        and _privacy_allows_engine(default_key, config)
+    ):
         default_cls = EngineRegistry.get(default_key)
         default_is_cloud = bool(getattr(default_cls, "is_cloud", False))
         try:
