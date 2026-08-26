@@ -31,7 +31,6 @@ export function Sidebar() {
   const createConversation = useAppStore((s) => s.createConversation);
   const selectedModel = useAppStore((s) => s.selectedModel);
   const serverInfo = useAppStore((s) => s.serverInfo);
-  const setCommandPaletteOpen = useAppStore((s) => s.setCommandPaletteOpen);
   const modelLoading = useAppStore((s) => s.modelLoading);
   const deepResearch = useAppStore((s) => s.deepResearch);
 
@@ -128,7 +127,7 @@ export function Sidebar() {
 
           {/* Model badge */}
           <button
-            onClick={() => setCommandPaletteOpen(true)}
+            onClick={() => navigate('/settings')}
             className="mx-3 mb-2 flex items-center gap-2 px-3 py-2 rounded-lg text-xs transition-colors cursor-pointer"
             style={{
               background: 'var(--color-bg-secondary)',
@@ -163,7 +162,7 @@ export function Sidebar() {
                 className="text-[10px] px-1.5 py-0.5 rounded font-mono"
                 style={{ background: 'var(--color-bg-tertiary)', color: 'var(--color-text-tertiary)' }}
               >
-                ⌘K
+                Impostazioni
               </kbd>
             )}
           </button>
