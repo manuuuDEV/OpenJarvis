@@ -97,6 +97,21 @@ class BrowserNavigateTool(BaseTool):
                 success=False,
             )
 
+        from openjarvis.security.browser_policy import (
+            blocked_navigation_reason,
+            blocked_suspicious_url_reason,
+        )
+
+        policy_error = blocked_navigation_reason(
+            str(url)
+        ) or blocked_suspicious_url_reason(str(url))
+        if policy_error:
+            return ToolResult(
+                tool_name="browser_navigate",
+                content=f"Browser navigation blocked: {policy_error}",
+                success=False,
+            )
+
         wait_for = params.get("wait_for", "load")
         if wait_for not in ("load", "domcontentloaded", "networkidle"):
             wait_for = "load"
@@ -243,6 +258,16 @@ class BrowserClickTool(BaseTool):
                     "No selector provided. Pass the visible text of the"
                     " element or a CSS selector."
                 ),
+                success=False,
+            )
+
+        from openjarvis.security.browser_policy import blocked_click_reason
+
+        policy_error = blocked_click_reason(selector)
+        if policy_error:
+            return ToolResult(
+                tool_name="browser_click",
+                content=f"Browser click blocked: {policy_error}",
                 success=False,
             )
 
@@ -439,6 +464,16 @@ class BrowserTypeTool(BaseTool):
             return ToolResult(
                 tool_name="browser_type",
                 content="No text provided.",
+                success=False,
+            )
+
+        from openjarvis.security.browser_policy import blocked_text_entry_reason
+
+        policy_error = blocked_text_entry_reason(str(selector), str(text))
+        if policy_error:
+            return ToolResult(
+                tool_name="browser_type",
+                content=f"Browser text entry blocked: {policy_error}",
                 success=False,
             )
 

@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square, Paperclip, Search } from 'lucide-react';
+import { Send, Square, Paperclip, Search, Radio } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppStore, generateId } from '../../lib/store';
 import { streamChat, streamResearch } from '../../lib/sse';
@@ -12,6 +12,7 @@ import {
 } from '../../lib/chat-telemetry';
 import { MicButton } from './MicButton';
 import { useSpeech } from '../../hooks/useSpeech';
+import { useGeminiLive } from '../../hooks/useGeminiLive';
 import type {
   ChatMessage,
   MessageTelemetry,
@@ -127,7 +128,16 @@ export function InputArea() {
     prevModelRef.current = selectedModel;
   }, [selectedModel, streamState.isStreaming, resetStream]);
 
-  const micDisabled = !speechEnabled || !speechAvailable || streamState.isStreaming;
+  const {
+    state: geminiLiveState,
+    error: geminiLiveError,
+    isLive: geminiLiveActive,
+    isConnecting: geminiLiveConnecting,
+    start: startGeminiLive,
+    stop: stopGeminiLive,
+  } = useGeminiLive();
+
+  const micDisabled = !speechEnabled || !speechAvailable || streamState.isStreaming || geminiLiveActive || geminiLiveConnecting;
   const micReason: 'not-enabled' | 'no-backend' | 'streaming' | undefined =
     !speechEnabled ? 'not-enabled'
     : !speechAvailable ? 'no-backend'
@@ -139,6 +149,12 @@ export function InputArea() {
       toast.error(speechError, { duration: 8000 });
     }
   }, [speechError]);
+
+  useEffect(() => {
+    if (geminiLiveError) {
+      toast.error(geminiLiveError, { duration: 8000 });
+    }
+  }, [geminiLiveError]);
 
   const handleMicClick = useCallback(async () => {
     if (speechState === 'recording') {
@@ -612,7 +628,7 @@ export function InputArea() {
           rows={1}
           className="flex-1 bg-transparent outline-none resize-none text-sm leading-relaxed"
           style={{ color: 'var(--color-text)', maxHeight: '200px' }}
-          disabled={streamState.isStreaming || modelLoading}
+          disabled={streamState.isStreaming || modelLoading || geminiLiveActive || geminiLiveConnecting}
         />
         {isCurrentChatStreaming ? (
           <button
@@ -632,6 +648,20 @@ export function InputArea() {
               reason={micReason}
             />
             <button
+              type="button"
+              onClick={() => void (geminiLiveActive || geminiLiveConnecting ? stopGeminiLive() : startGeminiLive())}
+              disabled={speechState === 'recording' || streamState.isStreaming || modelLoading}
+              title={geminiLiveActive || geminiLiveConnecting ? 'Termina Gemini Live' : 'Avvia Gemini Live (richiede consenso nelle Impostazioni)'}
+              aria-pressed={geminiLiveActive}
+              className="p-2 rounded-xl transition-colors shrink-0 cursor-pointer disabled:opacity-30 disabled:cursor-default"
+              style={{
+                background: geminiLiveActive ? 'var(--color-error)' : geminiLiveConnecting ? 'var(--color-accent-subtle)' : 'var(--color-bg-tertiary)',
+                color: geminiLiveActive || geminiLiveConnecting ? 'var(--color-accent)' : 'var(--color-text-tertiary)',
+              }}
+            >
+              {geminiLiveActive || geminiLiveConnecting ? <Square size={15} /> : <Radio size={16} />}
+            </button>
+            <button
               onClick={sendMessage}
               disabled={streamState.isStreaming || !input.trim() || modelLoading || !selectedModel}
               title={selectedModel ? 'Send message' : 'Pick a model first (⌘K)'}
@@ -646,6 +676,11 @@ export function InputArea() {
           </div>
         )}
       </div>
+      {geminiLiveActive || geminiLiveConnecting ? (
+        <div className="flex items-center justify-center mt-2 text-[11px]" style={{ color: 'var(--color-accent)' }}>
+          {geminiLiveConnecting ? 'Connessione Gemini Live in corso…' : 'Gemini Live attivo: il microfono è inviato direttamente a Google via TLS. Premi Stop per terminare.'}
+        </div>
+      ) : null}
       <div className="flex items-center justify-center mt-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
         <span>
           <kbd className="font-mono">Enter</kbd> to send &middot;{' '}

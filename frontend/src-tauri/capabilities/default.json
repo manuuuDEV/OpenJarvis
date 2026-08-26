@@ -1,19 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions for OpenJarvis Desktop",
+  "description": "Default least-privilege permissions for OpenJarvis Desktop",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "notification:default",
     "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister",
-    "dialog:allow-open",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        { "name": "binaries/ollama", "sidecar": true, "args": true }
-      ]
-    }
+    "global-shortcut:allow-unregister"
   ]
 }

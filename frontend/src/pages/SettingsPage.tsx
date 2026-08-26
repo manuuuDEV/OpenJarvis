@@ -16,48 +16,64 @@ import {
   Key,
   Search,
   Brain,
-  RefreshCw,
 } from 'lucide-react';
 import { useAppStore, type ThemeMode } from '../lib/store';
 import {
   checkHealth,
   fetchSpeechHealth,
+  getAndroidAdbConfig,
+  discoverAndroidAdbDevices,
+  setAndroidAdbConfig,
+  getTranscriptionSource,
+  setTranscriptionSource,
+  getGeminiLiveConfig,
+  setGeminiLiveConfig,
   getMemoryStats,
   getInferenceSource,
   setInferenceSource,
+  getControlledFolders,
+  setControlledFolders,
+  runSecureSelfTest,
   getCloudKeyStatus,
   saveCloudKey,
   fetchToolCredentialStatus,
   saveToolCredentials,
   deleteToolCredential,
   isTauri,
-  type InferenceSource,
+  type CloudProvider,
+  type AndroidAdbDevice,
+  type SecureSelfTestReport,
 } from '../lib/api';
-import { isAutoUpdateDisabled, setAutoUpdateDisabled } from '../components/Desktop/UpdateChecker';
 
 const CLOUD_KEY_STATUS_CHANGED = 'openjarvis-cloud-key-status-changed';
+const TRANSCRIPTION_STATUS_CHANGED = 'openjarvis-transcription-status-changed';
 
-function OllamaModelList() {
-  const [models, setModels] = useState<Array<{ name: string; size: number }>>([]);
-  useEffect(() => {
-    fetch('http://localhost:11434/api/tags')
-      .then(r => r.json())
-      .then(data => setModels((data.models || []).map((m: any) => ({ name: m.name, size: m.size }))))
-      .catch(() => setModels([]));
-  }, []);
-  if (models.length === 0) return <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>No models loaded</span>;
-  return (
-    <div className="flex flex-wrap gap-1">
-      {models.map(m => (
-        <span key={m.name} className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px]"
-          style={{ background: 'var(--color-bg-tertiary)', color: 'var(--color-text)' }}>
-          <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--color-success)', display: 'inline-block' }} />
-          {m.name} ({(m.size / 1e9).toFixed(1)} GB)
-        </span>
-      ))}
-    </div>
-  );
-}
+const CLOUD_PROVIDER_OPTIONS: Array<{
+  id: CloudProvider;
+  label: string;
+  keyName: string;
+  keyPlaceholder: string;
+  endpointRequired?: boolean;
+  endpointHint?: string;
+}> = [
+  { id: 'groq', label: 'Groq', keyName: 'GROQ_API_KEY', keyPlaceholder: 'gsk_...' },
+  { id: 'google', label: 'Google Gemini', keyName: 'GEMINI_API_KEY', keyPlaceholder: 'AI...' },
+  { id: 'openrouter', label: 'OpenRouter', keyName: 'OPENROUTER_API_KEY', keyPlaceholder: 'sk-or-...' },
+  { id: 'nvidia', label: 'NVIDIA NIM', keyName: 'NVIDIA_API_KEY', keyPlaceholder: 'nvapi-...' },
+  { id: 'sambanova', label: 'SambaNova Cloud', keyName: 'SAMBANOVA_API_KEY', keyPlaceholder: 'sn_...', endpointRequired: true, endpointHint: 'HTTPS endpoint shown in your SambaNova console' },
+  { id: 'alibaba', label: 'Alibaba Cloud Model Studio', keyName: 'DASHSCOPE_API_KEY', keyPlaceholder: 'sk-...', endpointRequired: true, endpointHint: 'Regional HTTPS endpoint from your Model Studio workspace' },
+  { id: 'openai', label: 'OpenAI', keyName: 'OPENAI_API_KEY', keyPlaceholder: 'sk-...' },
+  { id: 'pollinations', label: 'Pollinations', keyName: 'POLLINATIONS_API_KEY', keyPlaceholder: 'pk_ or sk_...' },
+  { id: 'huggingface', label: 'Hugging Face', keyName: 'HF_TOKEN', keyPlaceholder: 'hf_...' },
+  { id: 'together', label: 'Together AI', keyName: 'TOGETHER_API_KEY', keyPlaceholder: '...' },
+];
+
+const TRANSCRIPTION_PROVIDER_OPTIONS = [
+  { id: 'groq-whisper', label: 'Groq Whisper' },
+] as const;
+
+type TranscriptionProvider = '' | (typeof TRANSCRIPTION_PROVIDER_OPTIONS)[number]['id'];
+type TranscriptionModel = 'whisper-large-v3-turbo' | 'whisper-large-v3';
 
 function ApiKeyInput({
   keyName,
@@ -113,6 +129,7 @@ function ApiKeyInput({
       setHasKey(true);
       setSaved(true);
       window.dispatchEvent(new Event(CLOUD_KEY_STATUS_CHANGED));
+      if (keyName === 'GROQ_API_KEY') window.dispatchEvent(new Event(TRANSCRIPTION_STATUS_CHANGED));
       setTimeout(() => setSaved(false), 2000);
     } catch (e: any) {
       setError(e?.message || 'Failed to save API key');
@@ -133,6 +150,7 @@ function ApiKeyInput({
       setHasKey(false);
       setSaved(true);
       window.dispatchEvent(new Event(CLOUD_KEY_STATUS_CHANGED));
+      if (keyName === 'GROQ_API_KEY') window.dispatchEvent(new Event(TRANSCRIPTION_STATUS_CHANGED));
       setTimeout(() => setSaved(false), 2000);
     } catch (e: any) {
       setError(e?.message || 'Failed to remove API key');
@@ -162,40 +180,6 @@ function ApiKeyInput({
       {saved && <span className="text-[10px]" style={{ color: 'var(--color-success)' }}>Saved</span>}
       {error && <span className="text-[10px]" style={{ color: 'var(--color-error)' }}>{error}</span>}
     </div>
-  );
-}
-
-function CloudProviderStatus({ label, keyName }: { label: string; keyName: string }) {
-  const [hasKey, setHasKey] = useState(false);
-  const desktopKeyStorage = isTauri();
-
-  const refresh = useCallback(async () => {
-    if (!desktopKeyStorage) {
-      setHasKey(false);
-      return;
-    }
-    try {
-      const status = await getCloudKeyStatus();
-      setHasKey(!!status[keyName]);
-    } catch {
-      setHasKey(false);
-    }
-  }, [desktopKeyStorage, keyName]);
-
-  useEffect(() => {
-    void refresh();
-    window.addEventListener(CLOUD_KEY_STATUS_CHANGED, refresh);
-    return () => window.removeEventListener(CLOUD_KEY_STATUS_CHANGED, refresh);
-  }, [refresh]);
-
-  return (
-    <span className="flex items-center gap-1 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-      <span style={{
-        width: 6, height: 6, borderRadius: '50%', display: 'inline-block',
-        background: hasKey ? 'var(--color-success)' : 'var(--color-text-tertiary)',
-      }} />
-      {label}
-    </span>
   );
 }
 
@@ -242,27 +226,6 @@ export function SettingsPage() {
   const [speechBackendAvailable, setSpeechBackendAvailable] = useState<boolean | null>(null);
   const [saved, setSaved] = useState(false);
 
-  const [autoUpdateEnabled, setAutoUpdateEnabled] = useState(() => !isAutoUpdateDisabled());
-  const [updateCheckState, setUpdateCheckState] = useState<'idle' | 'checking' | 'available' | 'latest'>('idle');
-
-  const handleAutoUpdateToggle = useCallback((enabled: boolean) => {
-    setAutoUpdateEnabled(enabled);
-    setAutoUpdateDisabled(!enabled);
-  }, []);
-
-  const handleCheckNow = useCallback(async () => {
-    if (!(window as any).__TAURI_INTERNALS__) return;
-    setUpdateCheckState('checking');
-    try {
-      const { check } = await import('@tauri-apps/plugin-updater');
-      const update = await check();
-      setUpdateCheckState(update ? 'available' : 'latest');
-      setTimeout(() => setUpdateCheckState('idle'), 4000);
-    } catch {
-      setUpdateCheckState('idle');
-    }
-  }, []);
-
   const [memoryStats, setMemoryStats] = useState<{ entries: number; backend: string } | null>(null);
   const [memoryEnabled, setMemoryEnabled] = useState(() => {
     try { return localStorage.getItem('openjarvis-memory-enabled') !== 'false'; } catch { return true; }
@@ -280,34 +243,181 @@ export function SettingsPage() {
     try { return parseInt(localStorage.getItem('openjarvis-memory-max-tokens') || '2048'); } catch { return 2048; }
   });
 
-  const [srcKind, setSrcKind] = useState<InferenceSource['kind']>('ollama');
-  const [customHost, setCustomHost] = useState('http://localhost:1234/v1');
-  const [customModel, setCustomModel] = useState('');
-  const [customEngine, setCustomEngine] = useState('lmstudio');
-  const [customKey, setCustomKey] = useState('');
+  const [cloudProvider, setCloudProvider] = useState<CloudProvider>('openai');
+  const [cloudModel, setCloudModel] = useState('');
+  const [cloudKey, setCloudKey] = useState('');
+  const [cloudEndpoint, setCloudEndpoint] = useState('');
+  const [transcriptionProvider, setTranscriptionProvider] = useState<TranscriptionProvider>('');
+  const [transcriptionModel, setTranscriptionModel] = useState<TranscriptionModel>('whisper-large-v3-turbo');
+  const [transcriptionProcessingAcknowledged, setTranscriptionProcessingAcknowledged] = useState(false);
+  const [transcriptionMsg, setTranscriptionMsg] = useState('');
+  const [geminiLiveProcessingAcknowledged, setGeminiLiveProcessingAcknowledged] = useState(false);
+  const [geminiLiveMsg, setGeminiLiveMsg] = useState('');
+  const [providerProcessingAcknowledged, setProviderProcessingAcknowledged] = useState(false);
   const [srcMsg, setSrcMsg] = useState('');
+  const [androidAdbPath, setAndroidAdbPath] = useState('');
+  const [androidAdbDevices, setAndroidAdbDevices] = useState<AndroidAdbDevice[]>([]);
+  const [androidAdbSerial, setAndroidAdbSerial] = useState('');
+  const [androidAdbAcknowledged, setAndroidAdbAcknowledged] = useState(false);
+  const [androidAdbMsg, setAndroidAdbMsg] = useState('');
+  const [controlledFolders, setControlledFoldersState] = useState<string[]>([]);
+  const [controlledFolderInput, setControlledFolderInput] = useState('');
+  const [controlledFolderMsg, setControlledFolderMsg] = useState('');
+  const [secureSelfTestReport, setSecureSelfTestReport] = useState<SecureSelfTestReport | null>(null);
+  const [secureSelfTestRunning, setSecureSelfTestRunning] = useState(false);
+  const [secureSelfTestError, setSecureSelfTestError] = useState('');
 
   useEffect(() => {
     getInferenceSource().then((s) => {
-      setSrcKind(s.kind);
-      if (s.host) setCustomHost(s.host);
-      if (s.model) setCustomModel(s.model);
-      if (s.engine) setCustomEngine(s.engine);
+      if (s.provider) setCloudProvider(s.provider);
+      if (s.model) setCloudModel(s.model);
+      if (s.providerEndpoint) setCloudEndpoint(s.providerEndpoint);
+      setProviderProcessingAcknowledged(!!s.providerProcessingAcknowledged);
     }).catch(() => {});
+    getTranscriptionSource().then((s) => {
+      if (!s) return;
+      setTranscriptionProvider(s.provider ?? '');
+      setTranscriptionModel(s.model);
+      setTranscriptionProcessingAcknowledged(s.processing_acknowledged);
+    }).catch(() => {});
+    getGeminiLiveConfig().then((config) => {
+      if (config) setGeminiLiveProcessingAcknowledged(config.processingAcknowledged);
+    }).catch(() => {});
+    getAndroidAdbConfig().then((config) => {
+      if (!config) return;
+      setAndroidAdbPath(config.adb_path ?? '');
+      setAndroidAdbSerial(config.device_serial ?? '');
+      setAndroidAdbAcknowledged(config.diagnostics_acknowledged);
+    }).catch(() => {});
+    getControlledFolders().then(setControlledFoldersState).catch(() => {});
   }, []);
 
   const saveSource = useCallback(async () => {
     try {
-      if (srcKind === 'custom') {
-        await setInferenceSource({ kind: 'custom', host: customHost, model: customModel, engine: customEngine, apiKey: customKey || undefined });
-      } else {
-        await setInferenceSource({ kind: 'ollama' });
-      }
-      setSrcMsg('Saved — restart the app to apply.');
+      await setInferenceSource({
+        kind: 'cloud',
+        provider: cloudProvider,
+        model: cloudModel,
+        apiKey: cloudKey || undefined,
+        providerEndpoint: cloudEndpoint || undefined,
+        providerProcessingAcknowledged,
+      });
+      setCloudKey('');
+      setSrcMsg('Authorized cloud provider saved. Restart the app to apply.');
     } catch (e: any) {
       setSrcMsg(e?.message ?? 'Failed to save.');
     }
-  }, [srcKind, customHost, customModel, customEngine, customKey]);
+  }, [cloudProvider, cloudModel, cloudKey, cloudEndpoint, providerProcessingAcknowledged]);
+
+  const selectedProvider = CLOUD_PROVIDER_OPTIONS.find((item) => item.id === cloudProvider) ?? CLOUD_PROVIDER_OPTIONS[0];
+
+  const saveTranscriptionSource = useCallback(async () => {
+    try {
+      await setTranscriptionSource({
+        provider: transcriptionProvider || null,
+        model: transcriptionModel,
+        processing_acknowledged: transcriptionProcessingAcknowledged,
+      });
+      const health = await fetchSpeechHealth();
+      setSpeechBackendAvailable(health.available);
+      window.dispatchEvent(new Event(TRANSCRIPTION_STATUS_CHANGED));
+      setTranscriptionMsg(
+        transcriptionProvider
+          ? 'Groq Whisper saved. Recorded audio is sent to Groq only after you stop the microphone.'
+          : 'Cloud transcription disabled.',
+      );
+    } catch (e: any) {
+      setTranscriptionMsg(e?.message ?? 'Failed to save transcription settings.');
+    }
+  }, [transcriptionProvider, transcriptionModel, transcriptionProcessingAcknowledged]);
+
+  const saveGeminiLiveConfig = useCallback(async () => {
+    try {
+      await setGeminiLiveConfig(geminiLiveProcessingAcknowledged);
+      setGeminiLiveMsg(
+        geminiLiveProcessingAcknowledged
+          ? 'Gemini Live is enabled. Starting a conversation will request a one-use temporary token; microphone audio is sent directly to Google over TLS.'
+          : 'Gemini Live disabled.',
+      );
+    } catch (e: any) {
+      setGeminiLiveMsg(e?.message ?? 'Unable to save Gemini Live settings.');
+    }
+  }, [geminiLiveProcessingAcknowledged]);
+
+  const discoverAndroidDevices = useCallback(async () => {
+    setAndroidAdbMsg('');
+    try {
+      const devices = await discoverAndroidAdbDevices(androidAdbPath);
+      setAndroidAdbDevices(devices);
+      if (!devices.some((device) => device.serial === androidAdbSerial)) {
+        setAndroidAdbSerial('');
+      }
+      setAndroidAdbMsg(
+        devices.length
+          ? 'Device rilevati localmente. Seleziona solo il tuo device nello stato “device”.'
+          : 'Nessun device ADB rilevato. Collega e sblocca Android, attiva USB debugging e conferma la chiave RSA sul telefono.',
+      );
+    } catch (e: any) {
+      setAndroidAdbDevices([]);
+      setAndroidAdbMsg(e?.message ?? 'Rilevamento Android ADB non riuscito.');
+    }
+  }, [androidAdbPath, androidAdbSerial]);
+
+  const saveAndroidAdb = useCallback(async () => {
+    try {
+      await setAndroidAdbConfig({
+        adb_path: androidAdbPath || null,
+        device_serial: androidAdbSerial || null,
+        diagnostics_acknowledged: androidAdbAcknowledged,
+      });
+      setAndroidAdbMsg(
+        'Diagnostica Android ADB salvata. L’agente potrà solo proporre una scansione software in sola lettura, con approvazione ogni volta.',
+      );
+    } catch (e: any) {
+      setAndroidAdbMsg(e?.message ?? 'Impossibile salvare la configurazione Android ADB.');
+    }
+  }, [androidAdbPath, androidAdbSerial, androidAdbAcknowledged]);
+
+  const clearAndroidAdb = useCallback(async () => {
+    try {
+      await setAndroidAdbConfig({
+        adb_path: null,
+        device_serial: null,
+        diagnostics_acknowledged: false,
+      });
+      setAndroidAdbPath('');
+      setAndroidAdbDevices([]);
+      setAndroidAdbSerial('');
+      setAndroidAdbAcknowledged(false);
+      setAndroidAdbMsg('Diagnostica Android ADB disabilitata.');
+    } catch (e: any) {
+      setAndroidAdbMsg(e?.message ?? 'Impossibile disabilitare Android ADB.');
+    }
+  }, []);
+
+  const runDesktopSelfTest = useCallback(async () => {
+    setSecureSelfTestRunning(true);
+    setSecureSelfTestError('');
+    try {
+      setSecureSelfTestReport(await runSecureSelfTest());
+    } catch (e: any) {
+      setSecureSelfTestReport(null);
+      setSecureSelfTestError(e?.message ?? 'Impossibile eseguire la verifica sicura.');
+    } finally {
+      setSecureSelfTestRunning(false);
+    }
+  }, []);
+
+  const saveControlledFolders = useCallback(async (nextFolders: string[]) => {
+    try {
+      const savedFolders = await setControlledFolders(nextFolders);
+      setControlledFoldersState(savedFolders);
+      setControlledFolderInput('');
+      setControlledFolderMsg('Approved folders saved. The assistant can only use these folders and the dedicated workspace.');
+    } catch (e: any) {
+      setControlledFolderMsg(e?.message ?? 'Failed to save approved folders.');
+    }
+  }, []);
 
   useEffect(() => {
     checkHealth().then(setHealthy);
@@ -394,6 +504,68 @@ export function SettingsPage() {
         </header>
 
         <div className="flex flex-col gap-4">
+          <Section title="Verifica Jarvis">
+            <div className="flex flex-col gap-3">
+              <p className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                Controllo locale e senza effetti collaterali: non avvia broker, browser o ADB, non registra audio e non invia dati al cloud.
+              </p>
+              <div className="flex items-center gap-3 flex-wrap">
+                <button
+                  onClick={() => void runDesktopSelfTest()}
+                  disabled={!isTauri() || secureSelfTestRunning}
+                  className="px-3 py-2 rounded text-xs font-medium cursor-pointer disabled:cursor-not-allowed"
+                  style={{
+                    background: 'var(--color-accent)',
+                    color: 'var(--color-on-accent, white)',
+                    opacity: !isTauri() || secureSelfTestRunning ? 0.55 : 1,
+                  }}
+                >
+                  {secureSelfTestRunning ? 'Verifica in corso…' : 'Verifica Jarvis'}
+                </button>
+                {!isTauri() && (
+                  <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                    Disponibile nell’app desktop Windows.
+                  </span>
+                )}
+              </div>
+              {secureSelfTestError && (
+                <p className="text-xs" style={{ color: 'var(--color-error)' }}>{secureSelfTestError}</p>
+              )}
+              {secureSelfTestReport && (
+                <div className="rounded overflow-hidden" style={{ border: '1px solid var(--color-border)' }}>
+                  <div className="px-3 py-2 text-xs" style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text-secondary)' }}>
+                    {secureSelfTestReport.passed} verifiche superate · {secureSelfTestReport.warnings} avvisi · {secureSelfTestReport.liveChecksRequired} prove reali richieste
+                  </div>
+                  <div className="divide-y" style={{ borderColor: 'var(--color-border)' }}>
+                    {secureSelfTestReport.checks.map((check) => {
+                      const color = check.status === 'pass'
+                        ? 'var(--color-success)'
+                        : check.status === 'live_check_required'
+                          ? 'var(--color-accent)'
+                          : 'var(--color-warning)';
+                      const label = check.status === 'pass'
+                        ? 'Pronto'
+                        : check.status === 'live_check_required'
+                          ? 'Prova reale richiesta'
+                          : check.status === 'not_configured'
+                            ? 'Non configurato'
+                            : 'Attenzione';
+                      return (
+                        <div key={check.id} className="px-3 py-2 flex gap-3 items-start">
+                          <span className="shrink-0 text-[10px] font-medium mt-0.5" style={{ color }}>{label}</span>
+                          <div>
+                            <p className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{check.title}</p>
+                            <p className="text-[11px] mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>{check.detail}</p>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </Section>
+
           {/* Appearance */}
           <Section title="Appearance">
             <SettingRow label="Theme" description="Choose how OpenJarvis looks">
@@ -480,90 +652,190 @@ export function SettingsPage() {
             </SettingRow>
           </Section>
 
-          {/* Inference source */}
-          <Section title="Inference source">
-            <SettingRow label="Source" description="Where the app runs models. Applies after restart.">
+          {/* Cloud-only inference */}
+          <Section title="Authorized cloud inference">
+            <p className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
+              This build does not install, start, or download local models. Requests use TLS in transit; the selected provider processes the prompt and response within its own inference boundary.
+            </p>
+            <SettingRow label="Provider attivo" description="Un solo provider viene autorizzato e inviato al backend alla volta; le altre chiavi restano isolate nel portachiavi.">
               <select
-                value={srcKind}
-                onChange={(e) => { setSrcKind(e.target.value as InferenceSource['kind']); setSrcMsg(''); }}
+                value={cloudProvider}
+                onChange={(e) => {
+                  const next = e.target.value as CloudProvider;
+                  setCloudProvider(next);
+                  setCloudEndpoint('');
+                  setSrcMsg('');
+                }}
                 className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
                 style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
               >
-                <option value="ollama">Bundled Ollama (default)</option>
-                <option value="custom">Custom OpenAI-compatible server</option>
+                {CLOUD_PROVIDER_OPTIONS.map((provider) => (
+                  <option key={provider.id} value={provider.id}>{provider.label}</option>
+                ))}
               </select>
             </SettingRow>
-            {srcKind === 'custom' && (
-              <>
-                <SettingRow label="Server URL" description="e.g. LM Studio: http://localhost:1234/v1">
-                  <input type="text" value={customHost} onChange={(e) => { setCustomHost(e.target.value); setSrcMsg(''); }} placeholder="http://localhost:1234/v1"
-                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
-                </SettingRow>
-                <SettingRow label="Model" description="Model id served by your endpoint">
-                  <input type="text" value={customModel} onChange={(e) => { setCustomModel(e.target.value); setSrcMsg(''); }} placeholder="qwen2.5-7b-instruct"
-                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
-                </SettingRow>
-                <SettingRow label="Server type" description="OpenAI-compatible engine">
-                  <select value={customEngine} onChange={(e) => { setCustomEngine(e.target.value); setSrcMsg(''); }}
-                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}>
-                    <option value="lmstudio">LM Studio</option>
-                    <option value="vllm">vLLM</option>
-                    <option value="sglang">SGLang</option>
-                    <option value="llamacpp">llama.cpp</option>
-                    <option value="mlx">MLX</option>
-                  </select>
-                </SettingRow>
-                <SettingRow label="API key (optional)" description="Only if your server requires one">
-                  <input type="password" value={customKey} onChange={(e) => { setCustomKey(e.target.value); setSrcMsg(''); }} placeholder="leave blank if none"
-                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
-                </SettingRow>
-              </>
+            <SettingRow label="Modello" description="Inserisci un modello appartenente al provider attivo; non esiste fallback automatico verso altri provider.">
+              <input type="text" value={cloudModel} onChange={(e) => { setCloudModel(e.target.value); setSrcMsg(''); }} placeholder="Modello del provider"
+                className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+            </SettingRow>
+            {selectedProvider.endpointRequired && (
+              <SettingRow label="Endpoint del provider" description={selectedProvider.endpointHint}>
+                <input type="url" value={cloudEndpoint} onChange={(e) => { setCloudEndpoint(e.target.value); setSrcMsg(''); }} placeholder="https://..."
+                  autoComplete="off" className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                  style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+              </SettingRow>
             )}
+            <SettingRow label={`${selectedProvider.label} API key`} description="Salvata solo nel portachiavi di Windows; mai nel repository, file di configurazione o log.">
+              <input type="password" value={cloudKey} onChange={(e) => { setCloudKey(e.target.value); setSrcMsg(''); }} placeholder={selectedProvider.keyPlaceholder}
+                autoComplete="off" className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+            </SettingRow>
+            <SettingRow label="Provider processing acknowledgement" description="I understand that TLS protects the connection in transit, but the selected cloud provider processes prompts and responses. Do not include data you are not authorized to share.">
+              <label className="flex items-start gap-2 max-w-xs text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                <input
+                  type="checkbox"
+                  checked={providerProcessingAcknowledged}
+                  onChange={(e) => { setProviderProcessingAcknowledged(e.target.checked); setSrcMsg(''); }}
+                  className="mt-0.5"
+                />
+                <span>I explicitly authorize this provider for the selected model.</span>
+              </label>
+            </SettingRow>
             <SettingRow label="" description={srcMsg}>
-              <button onClick={saveSource}
+              <button onClick={saveSource} disabled={!providerProcessingAcknowledged}
                 className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
                 style={{ background: 'var(--color-accent, var(--color-bg-tertiary))', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}>
-                Save inference source
+                Save authorized cloud profile
               </button>
             </SettingRow>
           </Section>
 
-          {/* Models */}
-          <Section title="Models">
-            <SettingRow label="Local models (Ollama)" description="Models available for local inference">
-              <OllamaModelList />
-            </SettingRow>
-            <div className="text-xs mt-2 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
-              Run <code className="px-1 py-0.5 rounded text-[11px]" style={{ background: 'var(--color-bg-tertiary)' }}>ollama pull &lt;model-name&gt;</code> in your terminal to add more models
-            </div>
-            <SettingRow label="Cloud providers" description="Green dot means API key is configured">
-              <div className="flex flex-wrap gap-3">
-                <CloudProviderStatus label="OpenAI" keyName="OPENAI_API_KEY" />
-                <CloudProviderStatus label="Anthropic" keyName="ANTHROPIC_API_KEY" />
-                <CloudProviderStatus label="Google" keyName="GEMINI_API_KEY" />
-                <CloudProviderStatus label="OpenRouter" keyName="OPENROUTER_API_KEY" />
+          <Section title="Diagnostica Android ADB controllata">
+            <p className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
+              Collega solo il tuo Android, sbloccalo e accetta personalmente la chiave RSA di USB debugging. Il modulo non espone una shell ADB al modello: consente soltanto una scansione software in sola lettura del device scelto qui, dopo approvazione per ogni richiesta.
+            </p>
+            <SettingRow label="Android Platform Tools" description="Indica il file adb.exe contenuto nella cartella ufficiale platform-tools. Il percorso non viene inviato al backend cloud.">
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={androidAdbPath}
+                  onChange={(e) => { setAndroidAdbPath(e.target.value); setAndroidAdbDevices([]); setAndroidAdbSerial(''); setAndroidAdbMsg(''); }}
+                  placeholder={'C:\\Android\\Sdk\\platform-tools\\adb.exe'}
+                  autoComplete="off"
+                  className="text-sm px-3 py-1.5 rounded-lg outline-none w-72"
+                  style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+                />
+                <button
+                  onClick={() => void discoverAndroidDevices()}
+                  disabled={!androidAdbPath.trim()}
+                  className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
+                  style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+                >
+                  Rileva device
+                </button>
               </div>
             </SettingRow>
+            <SettingRow label="Device Android autorizzato" description="Il seriale rimane nelle impostazioni native locali. Sono selezionabili soltanto device nello stato “device”.">
+              <select
+                value={androidAdbSerial}
+                onChange={(e) => { setAndroidAdbSerial(e.target.value); setAndroidAdbMsg(''); }}
+                disabled={!androidAdbDevices.length}
+                className="text-sm px-3 py-1.5 rounded-lg outline-none w-72"
+                style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+              >
+                <option value="">Seleziona un device rilevato</option>
+                {androidAdbDevices.map((device) => (
+                  <option key={device.serial} value={device.serial} disabled={device.state !== 'device'}>
+                    {device.model ? `${device.model} — ` : ''}{device.serial} ({device.state})
+                  </option>
+                ))}
+              </select>
+            </SettingRow>
+            <SettingRow label="Consenso diagnostica software" description="La scansione legge versione Android, spazio, memoria, batteria e conteggio app. Non apre app, non invia tap/tastiera, non installa o rimuove software, non trasferisce file e non usa root.">
+              <label className="flex items-start gap-2 max-w-xs text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                <input
+                  type="checkbox"
+                  checked={androidAdbAcknowledged}
+                  onChange={(e) => { setAndroidAdbAcknowledged(e.target.checked); setAndroidAdbMsg(''); }}
+                  className="mt-0.5"
+                />
+                <span>Autorizzo soltanto la diagnostica Android ADB in sola lettura sul device selezionato.</span>
+              </label>
+            </SettingRow>
+            <SettingRow label="Stato Android ADB" description={androidAdbMsg || 'Configura Platform Tools, rileva il device, selezionalo e conferma il perimetro.'}>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => void saveAndroidAdb()}
+                  disabled={!androidAdbPath.trim() || !androidAdbSerial || !androidAdbAcknowledged}
+                  className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
+                  style={{ background: 'var(--color-accent, var(--color-bg-tertiary))', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+                >
+                  Salva autorizzazione
+                </button>
+                {(androidAdbPath || androidAdbSerial) && (
+                  <button
+                    onClick={() => void clearAndroidAdb()}
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
+                    style={{ color: 'var(--color-error)', border: '1px solid var(--color-error)' }}
+                  >
+                    Disabilita
+                  </button>
+                )}
+              </div>
+            </SettingRow>
+            <div className="text-xs mt-3 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
+              Dopo il salvataggio puoi chiedere in chat una “diagnostica software Android”. L’agente potrà soltanto proporla: la richiesta appare tra le approvazioni e il broker esegue una lista fissa di letture, non comandi ADB arbitrari.
+            </div>
           </Section>
 
-          {/* API Keys */}
-          <Section title="API Keys">
-            <SettingRow label="OpenAI" description="GPT-4, GPT-3.5, etc.">
-              <ApiKeyInput keyName="OPENAI_API_KEY" placeholder="sk-..." />
-            </SettingRow>
-            <SettingRow label="Anthropic" description="Claude models">
-              <ApiKeyInput keyName="ANTHROPIC_API_KEY" placeholder="sk-ant-..." />
-            </SettingRow>
-            <SettingRow label="Google" description="Gemini models">
-              <ApiKeyInput keyName="GEMINI_API_KEY" placeholder="AI..." />
-            </SettingRow>
-            <SettingRow label="OpenRouter" description="Multi-provider routing">
-              <ApiKeyInput keyName="OPENROUTER_API_KEY" placeholder="sk-or-..." />
-            </SettingRow>
+          <Section title="Controlled local folders">
+            <p className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
+              Add up to eight existing folders that you personally authorize. The model cannot add folders itself; file reads are limited and all writes or directory changes still require a separate, one-time approval in this app. System, credential, and broad home folders are rejected.
+            </p>
+            <div className="flex gap-2 mb-3">
+              <input
+                type="text"
+                value={controlledFolderInput}
+                onChange={(e) => { setControlledFolderInput(e.target.value); setControlledFolderMsg(''); }}
+                placeholder="C:\\Users\\you\\Documents\\Project"
+                className="flex-1 text-sm px-3 py-1.5 rounded-lg outline-none"
+                style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+              />
+              <button
+                onClick={() => void saveControlledFolders([...controlledFolders, controlledFolderInput.trim()])}
+                disabled={!controlledFolderInput.trim() || controlledFolders.length >= 8}
+                className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
+                style={{ background: 'var(--color-accent, var(--color-bg-tertiary))', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+              >
+                Add folder
+              </button>
+            </div>
+            {controlledFolders.map((folder) => (
+              <div key={folder} className="flex items-center justify-between gap-3 py-2 text-xs" style={{ borderTop: '1px solid var(--color-border-subtle)', color: 'var(--color-text-secondary)' }}>
+                <code className="truncate">{folder}</code>
+                <button
+                  onClick={() => void saveControlledFolders(controlledFolders.filter((item) => item !== folder))}
+                  className="px-2 py-1 rounded cursor-pointer"
+                  style={{ color: 'var(--color-error)', border: '1px solid var(--color-error)' }}
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+            {controlledFolderMsg && <p className="text-xs mt-3" style={{ color: 'var(--color-text-tertiary)' }}>{controlledFolderMsg}</p>}
+          </Section>
+
+          {/* Provider credentials */}
+          <Section title="Credenziali provider salvate">
+            <p className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
+              Puoi registrare più provider qui. Salvare una chiave non attiva non avvia chiamate: devi selezionare e autorizzare esplicitamente il profilo attivo sopra.
+            </p>
+            {CLOUD_PROVIDER_OPTIONS.map((provider) => (
+              <SettingRow key={provider.id} label={provider.label} description={`Credenziale ${provider.keyName} nel portachiavi di Windows`}>
+                <ApiKeyInput keyName={provider.keyName} placeholder={provider.keyPlaceholder} />
+              </SettingRow>
+            ))}
           </Section>
 
           {/* Tools */}
@@ -704,8 +976,60 @@ export function SettingsPage() {
           </Section>
 
           {/* Speech */}
-          <Section title="Speech">
-            <SettingRow label="Speech-to-Text" description="Enable microphone input for voice dictation">
+          <Section title="Voce e trascrizione">
+            <p className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
+              La registrazione resta sul dispositivo fino a quando interrompi il microfono. Se abiliti Groq Whisper, quel singolo file audio viene trasmesso a Groq via TLS per la trascrizione; la chiave rimane nel portachiavi del sistema operativo.
+            </p>
+            <SettingRow label="Provider di trascrizione" description="Nessun modello speech locale viene installato o avviato.">
+              <select
+                value={transcriptionProvider}
+                onChange={(e) => { setTranscriptionProvider(e.target.value as TranscriptionProvider); setTranscriptionMsg(''); }}
+                className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+              >
+                <option value="">Disabilitato</option>
+                {TRANSCRIPTION_PROVIDER_OPTIONS.map((provider) => (
+                  <option key={provider.id} value={provider.id}>{provider.label}</option>
+                ))}
+              </select>
+            </SettingRow>
+            {transcriptionProvider && (
+              <>
+                <SettingRow label="Modello Groq Whisper" description="Sono ammessi soltanto modelli di trascrizione Groq esplicitamente supportati.">
+                  <select
+                    value={transcriptionModel}
+                    onChange={(e) => { setTranscriptionModel(e.target.value as TranscriptionModel); setTranscriptionMsg(''); }}
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+                  >
+                    <option value="whisper-large-v3-turbo">whisper-large-v3-turbo</option>
+                    <option value="whisper-large-v3">whisper-large-v3</option>
+                  </select>
+                </SettingRow>
+                <SettingRow label="Consenso elaborazione audio" description="TLS protegge il trasporto; Groq elabora il file audio registrato per produrre la trascrizione.">
+                  <label className="flex items-start gap-2 max-w-xs text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                    <input
+                      type="checkbox"
+                      checked={transcriptionProcessingAcknowledged}
+                      onChange={(e) => { setTranscriptionProcessingAcknowledged(e.target.checked); setTranscriptionMsg(''); }}
+                      className="mt-0.5"
+                    />
+                    <span>Autorizzo Groq a elaborare le mie registrazioni vocali quando interrompo il microfono.</span>
+                  </label>
+                </SettingRow>
+              </>
+            )}
+            <SettingRow label="Salva trascrizione" description={transcriptionMsg}>
+              <button
+                onClick={() => void saveTranscriptionSource()}
+                disabled={!!transcriptionProvider && !transcriptionProcessingAcknowledged}
+                className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
+                style={{ background: 'var(--color-accent, var(--color-bg-tertiary))', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+              >
+                Salva impostazioni voce
+              </button>
+            </SettingRow>
+            <SettingRow label="Dettatura push-to-talk" description="Premi il microfono per registrare e premilo di nuovo per fermare. La trascrizione viene inserita nel campo di testo e resta modificabile prima dell’invio.">
               <button
                 onClick={() => { updateSettings({ speechEnabled: !settings.speechEnabled }); showSaved(); }}
                 className="relative w-11 h-6 rounded-full transition-colors cursor-pointer"
@@ -722,29 +1046,40 @@ export function SettingsPage() {
                 />
               </button>
             </SettingRow>
-            <SettingRow label="Backend status" description="Requires Whisper, Deepgram, or another speech backend">
+            <SettingRow label="Stato trascrizione" description="Controllato localmente dal runtime desktop; nessuna chiave è restituita all’interfaccia.">
               <div className="flex items-center gap-2">
                 <span
                   className="w-2 h-2 rounded-full"
-                  style={{
-                    background: speechBackendAvailable === true ? 'var(--color-success)'
-                      : speechBackendAvailable === false ? 'var(--color-text-tertiary)'
-                      : 'var(--color-text-tertiary)',
-                  }}
+                  style={{ background: speechBackendAvailable ? 'var(--color-success)' : 'var(--color-text-tertiary)' }}
                 />
                 <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-                  {speechBackendAvailable === null ? 'Checking...'
-                    : speechBackendAvailable ? 'Available'
-                    : 'Not configured'}
+                  {speechBackendAvailable === null ? 'Verifica in corso…' : speechBackendAvailable ? 'Groq Whisper disponibile' : 'Non configurata'}
                 </span>
               </div>
             </SettingRow>
-            {!speechBackendAvailable && speechBackendAvailable !== null && (
-              <div className="text-xs mt-2 px-1" style={{ color: 'var(--color-text-tertiary)' }}>
-                Set up a speech backend to use voice input.
-                See the <a href="https://open-jarvis.github.io/OpenJarvis/user-guide/tools/" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-accent)' }}>documentation</a> for details.
-              </div>
-            )}
+            <SettingRow label="Modalità conversazione" description="Disponibile ora come conversazione a turni: registra, controlla la trascrizione, invia, poi leggi la risposta. Non invia mai l’audio o il testo senza la tua azione.">
+              <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>A turni, non live</span>
+            </SettingRow>
+            <SettingRow label="Gemini 3.1 Flash Live" description="Conversazione audio-audio diretta con Google. La chiave Gemini resta nel portachiavi: all’avvio viene creato soltanto un token temporaneo, a uso singolo e vincolato al modello audio.">
+              <label className="flex items-start gap-2 max-w-xs text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                <input
+                  type="checkbox"
+                  checked={geminiLiveProcessingAcknowledged}
+                  onChange={(e) => { setGeminiLiveProcessingAcknowledged(e.target.checked); setGeminiLiveMsg(''); }}
+                  className="mt-0.5"
+                />
+                <span>Autorizzo Google a elaborare in tempo reale il microfono durante una sessione Gemini Live. So che TLS protegge il trasporto ma non è cifratura end-to-end verso Google.</span>
+              </label>
+            </SettingRow>
+            <SettingRow label="Salva Gemini Live" description={geminiLiveMsg || 'Richiede una chiave Gemini già salvata nel portachiavi del sistema operativo.'}>
+              <button
+                onClick={() => void saveGeminiLiveConfig()}
+                className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
+                style={{ background: 'var(--color-accent, var(--color-bg-tertiary))', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+              >
+                Salva Live
+              </button>
+            </SettingRow>
           </Section>
 
           {/* Data */}
@@ -784,39 +1119,6 @@ export function SettingsPage() {
                 onMouseLeave={(e) => { if (!confirmClear) e.currentTarget.style.background = 'transparent'; }}
               >
                 <Trash2 size={12} /> {confirmClear ? 'Click again to confirm' : 'Clear'}
-              </button>
-            </SettingRow>
-          </Section>
-
-          {/* Updates */}
-          <Section title="Updates">
-            <SettingRow label="Auto-update" description="Check for new desktop builds automatically every 30 minutes">
-              <button
-                onClick={() => handleAutoUpdateToggle(!autoUpdateEnabled)}
-                className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
-                style={{ background: autoUpdateEnabled ? 'var(--color-accent)' : 'var(--color-bg-tertiary)', border: '1px solid var(--color-border)' }}
-              >
-                <span
-                  className="inline-block h-3.5 w-3.5 rounded-full transition-transform"
-                  style={{
-                    background: 'white',
-                    transform: autoUpdateEnabled ? 'translateX(18px)' : 'translateX(2px)',
-                  }}
-                />
-              </button>
-            </SettingRow>
-            <SettingRow label="Check for updates" description="Manually check for a new version right now">
-              <button
-                onClick={handleCheckNow}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
-                style={{ background: 'var(--color-bg-tertiary)', border: '1px solid var(--color-border)', color: 'var(--color-text)', cursor: 'pointer' }}
-                disabled={updateCheckState === 'checking'}
-              >
-                <RefreshCw size={12} className={updateCheckState === 'checking' ? 'animate-spin' : ''} />
-                {updateCheckState === 'checking' && 'Checking...'}
-                {updateCheckState === 'available' && 'Update available — see banner above'}
-                {updateCheckState === 'latest' && 'Already up to date'}
-                {updateCheckState === 'idle' && 'Check now'}
               </button>
             </SettingRow>
           </Section>

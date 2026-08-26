@@ -131,3 +131,12 @@ learning.db
 minion_logs/
 *.oj-debug.json
 oj-debug.*.json
+
+# Ephemeral Windows code-signing configuration generated only in CI
+frontend/src-tauri/tauri.windows.conf.json
+
+# Generated at desktop build time from the reviewed commit; never commit a duplicate source snapshot.
+frontend/src-tauri/resources/openjarvis-source/
+!frontend/src-tauri/resources/
+!frontend/src-tauri/resources/openjarvis-source/
+!frontend/src-tauri/resources/openjarvis-source/.gitkeep

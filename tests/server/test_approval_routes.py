@@ -346,7 +346,8 @@ class TestApprovalStoreIntegration:
         }
         _queue(approval_store, payload=payload)
         action = client.get("/v1/approvals/pending").json()["actions"][0]
-        assert action["payload"]["email"]["to"] == "user@example.com"
+        assert action["payload"]["email"]["redacted"] is True
+        assert "user@example.com" not in str(action["payload"])
         assert action["payload"]["metadata"]["tags"] == ["newsletter", "promo"]
 
     def test_all_tiers_accepted(self, client, approval_store):

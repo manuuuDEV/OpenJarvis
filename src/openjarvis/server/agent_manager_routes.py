@@ -802,8 +802,10 @@ def _get_mcp_tools_locked(
 
 
 def _sse_chunk(chunk_id: str, model: str, content: str) -> str:
-    """Build a single SSE content chunk."""
+    """Build a single display-safe SSE content chunk."""
     import json as _json
+
+    from openjarvis.security.output_safety import sanitize_model_output
 
     data = {
         "id": chunk_id,
@@ -812,7 +814,7 @@ def _sse_chunk(chunk_id: str, model: str, content: str) -> str:
         "choices": [
             {
                 "index": 0,
-                "delta": {"content": content},
+                "delta": {"content": sanitize_model_output(content)},
                 "finish_reason": None,
             }
         ],
@@ -1182,16 +1184,14 @@ async def _stream_managed_agent(
                         elapsed_s = event.get("elapsed", 0)
 
                         # Stream content word-by-word
-                        words = content.split(" ")
-                        for i, word in enumerate(words):
-                            token = word if i == 0 else " " + word
-                            yield _sse_chunk(chunk_id, model, token)
+                        safe_content = sanitize_model_output(content)
+                        yield _sse_chunk(chunk_id, model, safe_content)
 
                         # Build usage + telemetry
                         prompt_tok = meta.get("prompt_tokens", 0)
                         comp_tok = meta.get("completion_tokens", 0)
                         total_tok = meta.get("total_tokens", 0)
-                        word_count = len(words)
+                        word_count = len(safe_content.split())
                         speed = round(word_count / elapsed_s) if elapsed_s > 0 else 0
 
                         # Final chunk with usage + telemetry
@@ -1226,7 +1226,7 @@ async def _stream_managed_agent(
                         # the deep-research turn so they survive reload).
                         manager.store_agent_response(
                             agent_id,
-                            content,
+                            safe_content,
                             tool_calls=dr_tool_calls or None,
                         )
                         break
@@ -1308,6 +1308,8 @@ async def _stream_managed_agent(
         finally:
             resolved_toolkit.close()
 
+    from openjarvis.security.output_safety import sanitize_model_output
+
     async def generate():
         """Async generator yielding SSE-formatted chunks with real token streaming."""
 
@@ -1320,11 +1322,12 @@ async def _stream_managed_agent(
 
         _query_start_ts = _lgtime.time()
         try:
+            safe_query = sanitize_model_output(user_content, max_chars=2_000)
             manager.add_learning_log(
                 agent_id,
                 "query_start",
-                f"Query: {user_content[:100]}",
-                {"full_query": user_content},
+                f"Query: {safe_query[:100]}",
+                {"full_query": safe_query},
             )
         except Exception as _qs_exc:
             logger.warning("Log query_start failed: %s", _qs_exc)
@@ -1343,25 +1346,11 @@ async def _stream_managed_agent(
                     max_tokens=max_tokens,
                     **stream_kwargs,
                 ):
-                    # Stream content tokens immediately to the client
+                    # Accumulate the complete response before emitting it.
+                    # Redacting token-by-token can expose credentials split across
+                    # adjacent chunks, so this deliberately sacrifices live text.
                     if chunk.content:
                         turn_content += chunk.content
-                        # Mirror partial content so a disconnect during
-                        # generation still saves what we've produced.
-                        persist_state["content"] = collected_content + turn_content
-                        chunk_data = {
-                            "id": chunk_id,
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"content": chunk.content},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk_data)}\n\n"
 
                     # Accumulate tool_call fragments
                     if chunk.tool_calls:
@@ -1374,7 +1363,11 @@ async def _stream_managed_agent(
                         current_finish_reason = chunk.finish_reason
 
             except Exception as exc:
-                logger.error("Managed agent stream error: %s", exc, exc_info=True)
+                logger.error(
+                    "Managed agent stream failed (%s)",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
                 error_data = {
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
@@ -1382,7 +1375,12 @@ async def _stream_managed_agent(
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": f"Error: {exc}"},
+                            "delta": {
+                                "content": (
+                                    "A response error occurred. "
+                                    "No technical details are shown."
+                                )
+                            },
                             "finish_reason": "stop",
                         }
                     ],
@@ -1424,19 +1422,20 @@ async def _stream_managed_agent(
                 for tc in sorted_tcs:
                     tool_name = tc["function"]["name"]
                     tool_args = tc["function"]["arguments"]
+                    safe_tool_args = sanitize_model_output(tool_args, max_chars=2_000)
                     tool_result_content = f"Tool '{tool_name}' not available"
                     tool_succeeded = False
 
                     _start_payload = json.dumps(
-                        {"tool": tool_name, "arguments": tool_args}
+                        {"tool": tool_name, "arguments": safe_tool_args}
                     )
                     yield f"event: tool_call_start\ndata: {_start_payload}\n\n"
                     try:
                         manager.add_learning_log(
                             agent_id,
                             "tool_call",
-                            f"Calling {tool_name}: {tool_args[:80]}",
-                            {"tool": tool_name, "arguments": tool_args or ""},
+                            f"Calling {tool_name}: {safe_tool_args[:80]}",
+                            {"tool": tool_name, "arguments": safe_tool_args or ""},
                         )
                     except Exception as _tc_exc:
                         logger.warning("Log tool_call failed: %s", _tc_exc)
@@ -1460,13 +1459,18 @@ async def _stream_managed_agent(
                             )
                     except Exception as tool_exc:
                         logger.error(
-                            "Tool execution error for %s: %s",
+                            "Tool execution failed for %s (%s)",
                             tool_name,
-                            tool_exc,
+                            type(tool_exc).__name__,
                             exc_info=True,
                         )
-                        tool_result_content = f"Error executing {tool_name}: {tool_exc}"
+                        tool_result_content = (
+                            "The local tool could not complete its requested action."
+                        )
 
+                    tool_result_content = sanitize_model_output(
+                        tool_result_content, max_chars=64_000
+                    )
                     tool_latency_ms = (_time.monotonic() * 1000) - tool_start_ms
                     collected_tool_calls.append(
                         {
@@ -1528,6 +1532,11 @@ async def _stream_managed_agent(
             persist_state["content"] = collected_content
             persist_state["tool_calls"] = list(collected_tool_calls)
             break
+
+        safe_content = sanitize_model_output(collected_content)
+        persist_state["content"] = safe_content
+        if safe_content:
+            yield _sse_chunk(chunk_id, model, safe_content)
 
         # Final chunk with finish_reason
         final_data = {

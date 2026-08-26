@@ -102,3 +102,36 @@ def test_explicit_unhealthy_backend_is_unavailable() -> None:
         return_value=backend,
     ):
         assert get_speech_backend(config) is None
+
+
+def test_secure_desktop_uses_only_enabled_groq_whisper(monkeypatch) -> None:
+    """The packaged desktop must never auto-discover a local speech backend."""
+    from openjarvis.speech._discovery import get_speech_backend
+
+    monkeypatch.setenv("OPENJARVIS_SECURE_DESKTOP_PROFILE", "1")
+    monkeypatch.setenv("OPENJARVIS_TRANSCRIPTION_PROVIDER", "groq-whisper")
+    config = JarvisConfig()
+    config.speech.backend = "auto"
+    backend = MagicMock(backend_id="groq-whisper")
+    backend.health.return_value = True
+
+    with patch(
+        "openjarvis.speech._discovery._create_backend", return_value=backend
+    ) as create:
+        assert get_speech_backend(config) is backend
+
+    assert create.call_args_list == [call("groq-whisper", config)]
+
+
+def test_secure_desktop_disables_speech_when_no_provider_selected(monkeypatch) -> None:
+    from openjarvis.speech._discovery import get_speech_backend
+
+    monkeypatch.setenv("OPENJARVIS_SECURE_DESKTOP_PROFILE", "1")
+    monkeypatch.delenv("OPENJARVIS_TRANSCRIPTION_PROVIDER", raising=False)
+    config = JarvisConfig()
+    config.speech.backend = "faster-whisper"
+
+    with patch("openjarvis.speech._discovery._create_backend") as create:
+        assert get_speech_backend(config) is None
+
+    create.assert_not_called()

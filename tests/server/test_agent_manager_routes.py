@@ -403,7 +403,9 @@ class TestAgentManagerStreaming:
                     content_chunks.append(delta_content)
 
         # Should have multiple token chunks (real streaming, not single burst)
-        assert len(content_chunks) > 1
+        # The privacy-first desktop profile buffers model text and emits one
+        # fully redacted content frame, so cross-chunk credentials cannot leak.
+        assert len(content_chunks) == 1
         full_content = "".join(content_chunks)
         assert "Echo:" in full_content
         assert "Hello world" in full_content
@@ -452,6 +454,45 @@ class TestAgentManagerStreaming:
 
         # Last chunk should have finish_reason="stop"
         assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+    def test_send_message_stream_redacts_secret_split_across_chunks(self, manager):
+        """A credential split across provider chunks must never reach SSE or storage."""
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient as TC
+
+        from openjarvis.engine._stubs import StreamChunk
+        from openjarvis.server.agent_manager_routes import create_agent_manager_router
+
+        engine = MagicMock()
+        engine.engine_id = "split-secret"
+        engine._model = "test-model"
+
+        async def _stream_full_secret(messages, *, model, **kwargs):
+            yield StreamChunk(content="Result: sk-proj-ABCDEF")
+            yield StreamChunk(content="1234567890abcdef")
+            yield StreamChunk(finish_reason="stop")
+
+        engine.stream_full = _stream_full_secret
+        app = FastAPI()
+        app.state.engine = engine
+        app.state.bus = None
+        for router in create_agent_manager_router(manager):
+            app.include_router(router)
+        client = TC(app)
+        agent = manager.create_agent(name="redaction_agent", agent_type="simple")
+
+        response = client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "respond", "stream": True},
+        )
+
+        assert response.status_code == 200
+        assert "sk-proj-ABCDEF1234567890abcdef" not in response.text
+        assert "[REDACTED_OPENAI_KEY]" in response.text
+        messages = manager.list_messages(agent["id"])
+        stored = next(m for m in messages if m["direction"] == "agent_to_user")
+        assert "sk-proj-ABCDEF1234567890abcdef" not in stored["content"]
 
     def test_send_message_stream_error_handling(self, manager):
         """Engine errors are reported gracefully via SSE."""

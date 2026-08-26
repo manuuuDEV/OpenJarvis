@@ -9,11 +9,13 @@ if TYPE_CHECKING:
     from openjarvis.core.config import JarvisConfig
     from openjarvis.speech._stubs import SpeechBackend
 
-# Priority order: local first, then cloud
+# General upstream priority. The secure desktop below bypasses this list so
+# it never discovers or starts a local speech model.
 DISCOVERY_ORDER = [
     "faster-whisper",
     "openai",
     "deepgram",
+    "groq-whisper",
 ]
 
 
@@ -46,6 +48,11 @@ def _create_backend(
             if not api_key:
                 return None
             return backend_cls(api_key=api_key)
+        elif key == "groq-whisper":
+            api_key = os.environ.get("GROQ_API_KEY", "")
+            if not api_key:
+                return None
+            return backend_cls(api_key=api_key)
         else:
             return backend_cls()
     except Exception:
@@ -62,6 +69,13 @@ def get_speech_backend(config: "JarvisConfig") -> Optional["SpeechBackend"]:
     import openjarvis.speech  # noqa: F401
 
     backend_key = config.speech.backend
+    if os.environ.get("OPENJARVIS_SECURE_DESKTOP_PROFILE") == "1":
+        # The packaged Windows profile is cloud-only and receives the selected
+        # Groq credential only when the user has enabled this transcription
+        # provider in desktop settings.
+        backend_key = os.environ.get("OPENJARVIS_TRANSCRIPTION_PROVIDER", "")
+        if backend_key != "groq-whisper":
+            return None
 
     if backend_key != "auto":
         backend = _create_backend(backend_key, config)

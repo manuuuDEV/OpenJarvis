@@ -28,6 +28,36 @@ _ANTHROPIC_PREFIXES = ("claude-",)
 _GOOGLE_PREFIXES = ("gemini-",)
 _MINIMAX_PREFIXES = ("MiniMax-",)
 
+# The secure desktop sets this only for the one provider selected by the user.
+# It takes precedence over name-based inference and never triggers fallback.
+_ACTIVE_PROVIDER_ENV = "OPENJARVIS_CLOUD_PROVIDER"
+_PROVIDER_ENDPOINT_ENV = "OPENJARVIS_CLOUD_PROVIDER_ENDPOINT"
+_SECURE_DESKTOP_PROFILE_ENV = "OPENJARVIS_SECURE_DESKTOP_PROFILE"
+_SECURE_DESKTOP_PROVIDERS = frozenset(
+    {
+        "openai",
+        "google",
+        "openrouter",
+        "groq",
+        "nvidia",
+        "sambanova",
+        "alibaba",
+        "pollinations",
+        "huggingface",
+        "together",
+    }
+)
+_OPENAI_COMPATIBLE_PROVIDERS: dict[str, tuple[str, str | None]] = {
+    "openrouter": ("OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
+    "groq": ("GROQ_API_KEY", "https://api.groq.com/openai/v1"),
+    "nvidia": ("NVIDIA_API_KEY", "https://integrate.api.nvidia.com/v1"),
+    "sambanova": ("SAMBANOVA_API_KEY", None),
+    "alibaba": ("DASHSCOPE_API_KEY", None),
+    "pollinations": ("POLLINATIONS_API_KEY", "https://gen.pollinations.ai"),
+    "huggingface": ("HF_TOKEN", "https://router.huggingface.co/v1"),
+    "together": ("TOGETHER_API_KEY", "https://api.together.ai/v1"),
+}
+
 # HuggingFace orgs that host local-only quantised models — never route to cloud.
 _LOCAL_HF_ORGS = (
     "mlx-community/",
@@ -40,8 +70,9 @@ _LOCAL_HF_ORGS = (
 def _load_keys() -> dict[str, str]:
     """Read available cloud keys every call so live updates are picked up."""
     keys: dict[str, str] = {}
-    # File first, then fall back to process environment
-    if _CLOUD_ENV_FILE.exists():
+    # The packaged desktop intentionally does not read a legacy key file:
+    # native startup injects only the single selected key from OS storage.
+    if os.environ.get(_SECURE_DESKTOP_PROFILE_ENV) != "1" and _CLOUD_ENV_FILE.exists():
         for raw in _CLOUD_ENV_FILE.read_text().splitlines():
             line = raw.strip()
             if line and not line.startswith("#") and "=" in line:
@@ -55,6 +86,13 @@ def _load_keys() -> dict[str, str]:
         "GOOGLE_API_KEY",
         "OPENROUTER_API_KEY",
         "MINIMAX_API_KEY",
+        "GROQ_API_KEY",
+        "NVIDIA_API_KEY",
+        "SAMBANOVA_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "POLLINATIONS_API_KEY",
+        "HF_TOKEN",
+        "TOGETHER_API_KEY",
     ):
         val = os.environ.get(name)
         if val:
@@ -63,7 +101,21 @@ def _load_keys() -> dict[str, str]:
 
 
 def get_provider(model: str) -> str | None:
-    """Return the provider for a model name, or None if it's a local model."""
+    """Return the selected provider, or infer one only for legacy configurations."""
+    explicit = os.environ.get(_ACTIVE_PROVIDER_ENV, "").strip().lower()
+    if os.environ.get(_SECURE_DESKTOP_PROFILE_ENV) == "1":
+        # The packaged desktop never routes by a model-name heuristic. Its
+        # native launcher supplies exactly one provider and credential.
+        return explicit if explicit in _SECURE_DESKTOP_PROVIDERS else None
+    legacy_providers = {
+        "openai",
+        "anthropic",
+        "google",
+        "minimax",
+        *_OPENAI_COMPATIBLE_PROVIDERS,
+    }
+    if explicit in legacy_providers:
+        return explicit
     if any(model.startswith(p) for p in _OPENAI_PREFIXES):
         return "openai"
     if any(model.startswith(p) for p in _ANTHROPIC_PREFIXES):
@@ -374,20 +426,23 @@ async def stream_cloud(
         async for token in _stream_google(model, messages, temperature, max_tokens):
             yield token
 
-    elif provider == "openrouter":
-        keys = _load_keys()
-        api_key = keys.get("OPENROUTER_API_KEY", "")
-        if not api_key:
-            raise ValueError(
-                "OPENROUTER_API_KEY not set — add it in the Cloud Models tab"
-            )
+    elif provider in _OPENAI_COMPATIBLE_PROVIDERS:
+        api_key_name, default_base_url = _OPENAI_COMPATIBLE_PROVIDERS[provider]
+        base_url = os.environ.get(_PROVIDER_ENDPOINT_ENV, "").strip()
+        if not base_url:
+            base_url = default_base_url or ""
+        if not base_url.startswith("https://"):
+            raise ValueError(f"{provider} requires an approved HTTPS provider endpoint")
+        provider_model = (
+            _openrouter_model_id(model) if provider == "openrouter" else model
+        )
         async for token in _stream_openai(
-            _openrouter_model_id(model),
+            provider_model,
             messages,
             temperature,
             max_tokens,
-            base_url="https://openrouter.ai/api/v1",
-            api_key_name="OPENROUTER_API_KEY",
+            base_url=base_url.rstrip("/"),
+            api_key_name=api_key_name,
         ):
             yield token
 

@@ -22,14 +22,14 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install system dependencies
         run: |
@@ -44,7 +44,7 @@ jobs:
             libdbus-1-dev
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '22'
 
@@ -60,10 +60,10 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: 'frontend/src-tauri -> target'
 
@@ -77,47 +77,26 @@ jobs:
         working-directory: frontend/src-tauri
         run: cargo test
 
-  # Remove stale artifacts from the desktop-edge rolling pre-release so that
-  # only the current build's files are available for download. (The stable
-  # `desktop-latest` channel the installed app polls is never cleaned here.)
-  clean-release:
-    needs: [validate]
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Delete old assets from desktop-edge
-        if: "!startsWith(github.ref, 'refs/tags/')"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="desktop-edge"
-          # List all asset IDs on the release and delete them
-          ASSET_IDS=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}" \
-            --jq '.assets[].id' 2>/dev/null || true)
-          for id in $ASSET_IDS; do
-            echo "Deleting asset $id"
-            gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id" || true
-          done
-
   build-and-release:
-    needs: [validate, clean-release]
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [validate]
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
 
     strategy:
       fail-fast: false
+      # This release profile intentionally ships Windows only. Keeping the
+      # Windows artifact independent avoids a macOS signing failure blocking
+      # the installer requested for this distribution.
       matrix:
         include:
-          - platform: ubuntu-22.04
-            args: ''
-          - platform: macos-14
-            args: '--target universal-apple-darwin'
           - platform: windows-latest
-            args: ''
+            args: '--bundles msi,nsis'
 
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Full history + tags so the workflow_dispatch fallback in
           # "Determine release info" can derive the dev version from the
@@ -236,17 +215,17 @@ jobs:
             libdbus-1-dev
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
-        uses: swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: 'frontend/src-tauri -> target'
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: '22'
 
@@ -257,16 +236,51 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Download Ollama sidecar
-        shell: bash
+      - name: Configure optional Windows code signing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
         run: |
-          cd frontend/src-tauri/scripts && chmod +x download-ollama.sh
-          if [[ "${{ matrix.platform }}" == "macos-14" ]]; then
-            ./download-ollama.sh aarch64-apple-darwin
-            ./download-ollama.sh x86_64-apple-darwin
-          else
-            ./download-ollama.sh
-          fi
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            Write-Host 'No Windows signing certificate configured; producing an unsigned installer.'
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_TIMESTAMP_URL)) {
+            Write-Error 'WINDOWS_CERTIFICATE requires WINDOWS_CERTIFICATE_PASSWORD and WINDOWS_TIMESTAMP_URL.'
+            exit 1
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'openjarvis-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $securePassword = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+            if ($null -eq $certificate -or [string]::IsNullOrWhiteSpace($certificate.Thumbprint)) {
+              throw 'The code-signing certificate could not be imported.'
+            }
+            $windowsConfig = @{
+              bundle = @{
+                windows = @{
+                  certificateThumbprint = $certificate.Thumbprint
+                  digestAlgorithm = 'sha256'
+                  timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+                }
+              }
+            } | ConvertTo-Json -Depth 5
+            Set-Content -Path 'frontend/src-tauri/tauri.windows.conf.json' -Value $windowsConfig -Encoding utf8NoBOM
+            Write-Host 'Windows code signing is configured for this ephemeral runner.'
+          }
+          finally {
+            if (Test-Path $certificatePath) {
+              Remove-Item -Path $certificatePath -Force
+            }
+          }
+
+      - name: Stage reviewed local backend source
+        shell: bash
+        run: scripts/release/stage-secure-desktop-source.sh
 
       - name: Determine release info
         id: release-info
@@ -352,12 +366,12 @@ jobs:
 
       - name: Build and release
         timeout-minutes: 120
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          TAURI_CONFIG: '{"version":"${{ steps.release-info.outputs.tauri_version }}","bundle":{"createUpdaterArtifacts":true,"externalBin":["binaries/ollama"]}}'
+          TAURI_CONFIG: '{"version":"${{ steps.release-info.outputs.tauri_version }}","bundle":{"createUpdaterArtifacts":false}}'
           # tauri-action runs beforeBuildCommand (npm run build:tauri -> vite
           # build), which requires this at build time (#587). Strict for
           # releases: a missing/empty secret fails the build by design.
@@ -367,48 +381,110 @@ jobs:
           tauriScript: npx tauri
           tagName: ${{ steps.release-info.outputs.tag }}
           releaseName: ${{ steps.release-info.outputs.name }}
-          releaseBody: 'Desktop application built from ${{ github.sha }}'
+          releaseBody: 'Desktop application built from ${{ github.sha }}. Privacy-first build: external inference requires explicit provider consent; no Ollama sidecar and no auto-update artifacts are included.'
           releaseDraft: false
           prerelease: ${{ steps.release-info.outputs.prerelease }}
-          uploadUpdaterJson: true
+          uploadUpdaterJson: false
           args: ${{ matrix.args }}
 
-  # When a stable `desktop-v*` release is published, repoint the
-  # `desktop-latest` auto-update channel (the endpoint the installed app
-  # polls) at it. The stable release's own `latest.json` already references
-  # this release's signed assets, so we copy it verbatim — installed apps are
-  # only ever offered vetted stable builds, never `desktop-edge` dev builds.
-  refresh-stable-channel:
-    needs: [build-and-release]
-    if: startsWith(github.ref, 'refs/tags/desktop-v')
-    runs-on: ubuntu-latest
+  build-private-windows-artifact:
+    needs: [validate]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
     steps:
-      - name: Mirror stable latest.json into desktop-latest
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: 'frontend/src-tauri -> target'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+
+      - name: Use the reviewed npm toolchain
+        run: npm install --global npm@11.19.0
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Configure optional Windows code signing
+        shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STABLE_TAG: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
         run: |
-          set -euo pipefail
-          # The stable release's updater manifest may take a moment to become
-          # downloadable after tauri-action publishes it; retry briefly.
-          URL="https://github.com/${REPO}/releases/download/${STABLE_TAG}/latest.json"
-          for attempt in 1 2 3 4 5; do
-            if curl -fsSL -o latest.json "$URL"; then
-              echo "Fetched ${STABLE_TAG}/latest.json on attempt ${attempt}"
-              break
-            fi
-            echo "latest.json not ready yet (attempt ${attempt}); sleeping 15s"
-            sleep 15
-          done
-          test -s latest.json || { echo "::error::Could not fetch ${URL}"; exit 1; }
-          # Ensure the channel release exists (prerelease so it never usurps
-          # the stable "Latest" badge), then replace its manifest in place.
-          if ! gh release view desktop-latest --repo "$REPO" >/dev/null 2>&1; then
-            gh release create desktop-latest --repo "$REPO" \
-              --prerelease \
-              --title "Desktop Auto-Update Channel" \
-              --notes "Auto-update channel pointer for the desktop app. Mirrors the latest stable \`desktop-v*\` release; the in-app updater polls this \`latest.json\`. Download the app from the latest stable release, not here."
-          fi
-          gh release upload desktop-latest latest.json --repo "$REPO" --clobber
-          echo "desktop-latest now mirrors ${STABLE_TAG}"
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            Write-Host 'No Windows signing certificate configured; producing an unsigned installer.'
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_TIMESTAMP_URL)) {
+            Write-Error 'WINDOWS_CERTIFICATE requires WINDOWS_CERTIFICATE_PASSWORD and WINDOWS_TIMESTAMP_URL.'
+            exit 1
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'openjarvis-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $securePassword = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+            if ($null -eq $certificate -or [string]::IsNullOrWhiteSpace($certificate.Thumbprint)) {
+              throw 'The code-signing certificate could not be imported.'
+            }
+            $windowsConfig = @{
+              bundle = @{
+                windows = @{
+                  certificateThumbprint = $certificate.Thumbprint
+                  digestAlgorithm = 'sha256'
+                  timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+                }
+              }
+            } | ConvertTo-Json -Depth 5
+            Set-Content -Path 'frontend/src-tauri/tauri.windows.conf.json' -Value $windowsConfig -Encoding utf8NoBOM
+            Write-Host 'Windows code signing is configured for this ephemeral runner.'
+          }
+          finally {
+            if (Test-Path $certificatePath) {
+              Remove-Item -Path $certificatePath -Force
+            }
+          }
+
+      - name: Stage reviewed local backend source
+        shell: bash
+        run: scripts/release/stage-secure-desktop-source.sh
+
+      - name: Determine private build version
+        id: private-build
+        shell: bash
+        run: |
+          VERSION="1.0.2-dev.${{ github.run_number }}"
+          echo "tauri_version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build private Windows installers
+        timeout-minutes: 120
+        working-directory: frontend
+        env:
+          TAURI_CONFIG: '{"version":"${{ steps.private-build.outputs.tauri_version }}","bundle":{"createUpdaterArtifacts":false}}'
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: npx tauri build --bundles msi,nsis
+
+      - name: Upload private Windows installers
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openjarvis-desktop-windows-private-${{ github.run_number }}
+          path: |
+            frontend/src-tauri/target/release/bundle/msi/*.msi
+            frontend/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 7

@@ -20,6 +20,13 @@ from openjarvis.core import get_python_executable
 from openjarvis.tools.shell_exec import ShellExecTool
 
 
+@pytest.fixture(autouse=True)
+def _enable_shell_exec_for_legacy_execution_tests(monkeypatch):
+    """Existing execution tests model an explicitly approved deployment."""
+    monkeypatch.setenv("OPENJARVIS_ENABLE_DANGEROUS_TOOLS", "1")
+    monkeypatch.setenv("OPENJARVIS_ENABLE_SHELL_EXEC", "1")
+
+
 def _rust_output(stdout: str = "", stderr: str = "", code: int = 0) -> str:
     """Build the Rust shell_exec output format."""
     return f"Exit code: {code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
@@ -40,6 +47,12 @@ def _make_mock_rust(side_effect=None, return_value=None):
 
 
 class TestShellExecTool:
+    def test_disabled_without_explicit_opt_in(self, monkeypatch):
+        monkeypatch.delenv("OPENJARVIS_ENABLE_SHELL_EXEC", raising=False)
+        result = ShellExecTool().execute(command="echo should-not-run")
+        assert result.success is False
+        assert "disabled by default" in result.content
+
     def test_registered_via_tools_package_import(self):
         import openjarvis.tools as tools_pkg
         from openjarvis.core.registry import ToolRegistry

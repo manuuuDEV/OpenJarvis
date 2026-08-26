@@ -5,6 +5,7 @@ use openjarvis_core::{OpenJarvisError, ToolResult, ToolSpec};
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::env;
 use std::process::Command;
 
 static SPEC: Lazy<ToolSpec> = Lazy::new(|| ToolSpec {
@@ -37,6 +38,13 @@ impl BaseTool for ShellExecTool {
         &SPEC
     }
     fn execute(&self, params: &Value) -> Result<ToolResult, OpenJarvisError> {
+        if env::var("OPENJARVIS_ENABLE_SHELL_EXEC").as_deref() != Ok("1") {
+            return Ok(ToolResult::failure(
+                "shell_exec",
+                "Shell execution is disabled by default. Set OPENJARVIS_ENABLE_SHELL_EXEC=1 only in an isolated, explicitly reviewed deployment.",
+            ));
+        }
+
         let command = params["command"].as_str().unwrap_or("");
         let cwd = params["cwd"].as_str();
 

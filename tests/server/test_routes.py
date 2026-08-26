@@ -1669,3 +1669,49 @@ class TestTraceRecording:
         assert trace.query == "stream please"
         # _make_engine streams "Hello", " ", "world".
         assert trace.result == "Hello world"
+
+
+def test_non_streaming_completion_redacts_provider_key() -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    engine = _make_engine(content=f"Never disclose {secret}")
+    app = create_app(engine, "test-model", config=_test_config())
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "reply"}],
+        },
+    )
+
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    assert secret not in content
+    assert "REDACTED_OPENAI_KEY" in content
+
+
+def test_streaming_completion_redacts_secret_split_across_tokens() -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    engine = _make_engine()
+
+    async def split_secret_stream(*args, **kwargs):
+        yield "Never disclose sk-proj-abcdefgh"
+        yield "ijklmnopqrstuvwxyz123456"
+
+    engine.stream = split_secret_stream
+    app = create_app(engine, "test-model", config=_test_config())
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "reply"}],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert secret not in response.text
+    assert "REDACTED_OPENAI_KEY" in response.text

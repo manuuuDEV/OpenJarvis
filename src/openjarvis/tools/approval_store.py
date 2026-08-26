@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,9 @@ STATUS_APPROVED = "approved"
 STATUS_DENIED = "denied"
 STATUS_EXPIRED = "expired"
 STATUS_EXECUTED = "executed"
+# A desktop plan is claimed atomically by the local native broker before it is
+# handed over for execution. This prevents replay by a second local process.
+STATUS_EXECUTING = "executing"
 
 # Tiers govern default ask behavior
 TIER_TRIVIAL = "trivial"  # Execute immediately, no ask
@@ -153,6 +157,7 @@ class ApprovalStore:
         self._db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = threading.RLock()
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
         self._conn.commit()
@@ -194,42 +199,70 @@ class ApprovalStore:
         tier: str,
         ttl_hours: int = 24,
     ) -> PendingAction:
-        """Create and persist a new pending action."""
+        """Create one pending action or return an identical unexpired proposal.
+
+        Agent loops can retry a tool call after a network/model failure. Returning
+        the existing proposal prevents approval-card spam while preserving the
+        existing one-time approve/claim/execution lifecycle.
+        """
         now = datetime.now(timezone.utc)
-        action = PendingAction(
-            id=uuid.uuid4().hex[:12],
-            action_type=action_type,
-            description=description,
-            payload=payload,
-            permission_key=permission_key,
-            tier=tier,
-            status=STATUS_PENDING,
-            created_at=now.isoformat(),
-            expires_at=(now + timedelta(hours=ttl_hours)).isoformat(),
-        )
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO pending_actions
-                (id, action_type, description, payload, permission_key,
-                 tier, status, created_at, expires_at, notification_sent, decision_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                action.id,
-                action.action_type,
-                action.description,
-                json.dumps(action.payload),
-                action.permission_key,
-                action.tier,
-                action.status,
-                action.created_at,
-                action.expires_at,
-                int(action.notification_sent),
-                action.decision_at,
-            ),
-        )
-        self._conn.commit()
-        return action
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, action_type, description, payload, permission_key, "
+                "tier, status, created_at, expires_at, notification_sent, decision_at "
+                "FROM pending_actions WHERE action_type = ? AND description = ? "
+                "AND permission_key = ? AND tier = ? AND payload = ? "
+                "AND status = ? AND expires_at > ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (
+                    action_type,
+                    description,
+                    permission_key,
+                    tier,
+                    payload_json,
+                    STATUS_PENDING,
+                    now.isoformat(),
+                ),
+            ).fetchone()
+            if row:
+                return PendingAction.from_row(row)
+
+            action = PendingAction(
+                id=uuid.uuid4().hex[:12],
+                action_type=action_type,
+                description=description,
+                payload=payload,
+                permission_key=permission_key,
+                tier=tier,
+                status=STATUS_PENDING,
+                created_at=now.isoformat(),
+                expires_at=(now + timedelta(hours=ttl_hours)).isoformat(),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO pending_actions
+                    (id, action_type, description, payload, permission_key,
+                     tier, status, created_at, expires_at,
+                     notification_sent, decision_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action.id,
+                    action.action_type,
+                    action.description,
+                    payload_json,
+                    action.permission_key,
+                    action.tier,
+                    action.status,
+                    action.created_at,
+                    action.expires_at,
+                    int(action.notification_sent),
+                    action.decision_at,
+                ),
+            )
+            self._conn.commit()
+            return action
 
     def get_action(self, action_id: str) -> Optional[PendingAction]:
         row = self._conn.execute(
@@ -282,6 +315,44 @@ class ApprovalStore:
                 (status, now, action_id),
             )
         self._conn.commit()
+
+    def record_execution_result(
+        self,
+        action_id: str,
+        *,
+        success: bool,
+        summary: str,
+    ) -> None:
+        """Persist a locally redacted execution result within the action audit."""
+
+        action = self.get_action(action_id)
+        if action is None:
+            return
+        payload = dict(action.payload)
+        payload["execution"] = {"success": bool(success), "summary": summary}
+        self._conn.execute(
+            "UPDATE pending_actions SET payload = ? WHERE id = ?",
+            (json.dumps(payload), action_id),
+        )
+        self._conn.commit()
+
+    def claim_approved_action(self, action_id: str) -> Optional[PendingAction]:
+        """Claim one unexpired approved action for a local single-use broker.
+
+        The conditional update is intentional: it makes a duplicate broker poll
+        fail closed rather than receiving the same action payload twice.
+        """
+
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self._conn.execute(
+            "UPDATE pending_actions SET status = ?, decision_at = ? "
+            "WHERE id = ? AND status = ? AND expires_at > ?",
+            (STATUS_EXECUTING, now, action_id, STATUS_APPROVED, now),
+        )
+        self._conn.commit()
+        if cur.rowcount != 1:
+            return None
+        return self.get_action(action_id)
 
     def expire_stale(self) -> int:
         """Mark past-TTL pending actions as expired. Returns count."""

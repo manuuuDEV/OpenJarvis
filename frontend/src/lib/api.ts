@@ -39,6 +39,58 @@ export async function saveCloudKey(keyName: string, keyValue: string): Promise<v
   }
 }
 
+export async function getControlledFolders(): Promise<string[]> {
+  if (!isTauri()) return [];
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<string[]>('get_controlled_folders');
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to read controlled folders');
+  }
+}
+
+export interface SecureSelfTestCheck {
+  id: string;
+  status: 'pass' | 'warning' | 'not_configured' | 'live_check_required';
+  title: string;
+  detail: string;
+}
+
+export interface SecureSelfTestReport {
+  checks: SecureSelfTestCheck[];
+  passed: number;
+  warnings: number;
+  liveChecksRequired: number;
+}
+
+/**
+ * Runs only native, non-destructive configuration and local-health checks.
+ * It never starts a broker, records audio, enumerates a device, or sends cloud data.
+ */
+export async function runSecureSelfTest(): Promise<SecureSelfTestReport> {
+  if (!isTauri()) {
+    throw new Error('La verifica sicura è disponibile soltanto nell’app desktop.');
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<SecureSelfTestReport>('run_secure_self_test');
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Impossibile eseguire la verifica sicura.');
+  }
+}
+
+export async function setControlledFolders(folders: string[]): Promise<string[]> {
+  if (!isTauri()) {
+    throw new Error('Controlled folders can be configured in the desktop app only.');
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<string[]>('set_controlled_folders', { folders });
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to save controlled folders');
+  }
+}
+
 // Cached API base URL fetched from the Tauri backend at startup.
 // This avoids hardcoding the port — the Rust backend is the single
 // source of truth for JARVIS_PORT.
@@ -331,6 +383,39 @@ export interface SpeechHealth {
   available: boolean;
   backend?: string;
   reason?: string;
+  model?: string;
+}
+
+export interface TranscriptionSource {
+  provider: 'groq-whisper' | null;
+  model: 'whisper-large-v3-turbo' | 'whisper-large-v3';
+  processing_acknowledged: boolean;
+}
+
+export async function getTranscriptionSource(): Promise<TranscriptionSource | null> {
+  if (!isTauri()) return null;
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<TranscriptionSource>('get_transcription_source');
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to read transcription settings');
+  }
+}
+
+export async function setTranscriptionSource(source: TranscriptionSource): Promise<void> {
+  if (!isTauri()) {
+    throw new Error('Transcription providers can be configured in the desktop app only.');
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('set_transcription_source', {
+      provider: source.provider,
+      model: source.model,
+      processingAcknowledged: source.processing_acknowledged,
+    });
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to save transcription settings');
+  }
 }
 
 export async function transcribeAudio(audioBlob: Blob, filename = 'recording.webm'): Promise<TranscriptionResult> {
@@ -368,7 +453,7 @@ export async function transcribeAudio(audioBlob: Blob, filename = 'recording.web
 export async function fetchSpeechHealth(): Promise<SpeechHealth> {
   if (isTauri()) {
     try {
-      return await tauriInvoke<SpeechHealth>('speech_health');
+      return await tauriInvoke<SpeechHealth>('get_transcription_status');
     } catch {
       return { available: false };
     }
@@ -376,6 +461,112 @@ export async function fetchSpeechHealth(): Promise<SpeechHealth> {
   const res = await apiFetch(`/v1/speech/health`);
   if (!res.ok) return { available: false };
   return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Gemini Live (desktop only)
+// ---------------------------------------------------------------------------
+
+export interface GeminiLiveConfig {
+  processingAcknowledged: boolean;
+}
+
+export interface GeminiLiveSessionToken {
+  accessToken: string;
+  expiresAt: string | null;
+}
+
+export async function getGeminiLiveConfig(): Promise<GeminiLiveConfig | null> {
+  if (!isTauri()) return null;
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<GeminiLiveConfig>('get_gemini_live_config');
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to read Gemini Live settings');
+  }
+}
+
+export async function setGeminiLiveConfig(processingAcknowledged: boolean): Promise<void> {
+  if (!isTauri()) {
+    throw new Error('Gemini Live can be configured in the desktop app only.');
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('set_gemini_live_config', { processingAcknowledged });
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to save Gemini Live settings');
+  }
+}
+
+/**
+ * Returns a one-use temporary token constrained by native code to Gemini Live
+ * audio. Call only immediately before opening the WebSocket; do not persist,
+ * log, or render the token.
+ */
+export async function mintGeminiLiveSessionToken(): Promise<GeminiLiveSessionToken> {
+  if (!isTauri()) {
+    throw new Error('Gemini Live is available in the desktop app only.');
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<GeminiLiveSessionToken>('mint_gemini_live_session_token');
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to create a Gemini Live session');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Controlled Android ADB diagnostics (desktop only)
+// ---------------------------------------------------------------------------
+
+export interface AndroidAdbConfig {
+  adb_path: string | null;
+  device_serial: string | null;
+  diagnostics_acknowledged: boolean;
+}
+
+export interface AndroidAdbDevice {
+  serial: string;
+  state: string;
+  model: string | null;
+}
+
+export async function getAndroidAdbConfig(): Promise<AndroidAdbConfig | null> {
+  if (!isTauri()) return null;
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<AndroidAdbConfig>('get_android_adb_config');
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to read Android ADB settings');
+  }
+}
+
+export async function discoverAndroidAdbDevices(adbPath: string): Promise<AndroidAdbDevice[]> {
+  if (!isTauri()) {
+    throw new Error('Android ADB discovery is available in the desktop app only.');
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<AndroidAdbDevice[]>('discover_android_adb_devices', { adbPath });
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to discover Android devices');
+  }
+}
+
+export async function setAndroidAdbConfig(config: AndroidAdbConfig): Promise<void> {
+  if (!isTauri()) {
+    throw new Error('Android ADB can be configured in the desktop app only.');
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('set_android_adb_config', {
+      adbPath: config.adb_path,
+      deviceSerial: config.device_serial,
+      diagnosticsAcknowledged: config.diagnostics_acknowledged,
+    });
+  } catch (e: any) {
+    throw new Error(e?.message ?? e ?? 'Failed to save Android ADB settings');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,11 +1298,24 @@ export async function denyAction(actionId: string): Promise<void> {
 // Inference source (desktop only)
 // ---------------------------------------------------------------------------
 
+export type CloudProvider =
+  | 'openai'
+  | 'google'
+  | 'openrouter'
+  | 'groq'
+  | 'nvidia'
+  | 'sambanova'
+  | 'alibaba'
+  | 'pollinations'
+  | 'huggingface'
+  | 'together';
+
 export type InferenceSource = {
-  kind: 'ollama' | 'custom';
+  kind: 'cloud';
   model?: string;
-  host?: string;
-  engine?: string;
+  provider?: CloudProvider;
+  providerEndpoint?: string;
+  providerProcessingAcknowledged?: boolean;
 };
 
 export async function getInferenceSource(): Promise<InferenceSource> {
@@ -1123,11 +1327,11 @@ export async function getInferenceSource(): Promise<InferenceSource> {
       throw new Error(e?.message ?? e ?? 'Failed to read inference source');
     }
   }
-  return { kind: 'ollama' };
+  return { kind: 'cloud' };
 }
 
 export async function setInferenceSource(
-  src: InferenceSource & { apiKey?: string },
+  src: InferenceSource & { apiKey?: string; providerProcessingAcknowledged: boolean },
 ): Promise<void> {
   if (!isTauri()) throw new Error('Inference source is configurable in the desktop app only.');
   try {
@@ -1135,9 +1339,12 @@ export async function setInferenceSource(
     await invoke<void>('set_inference_source', {
       kind: src.kind,
       model: src.model ?? null,
-      host: src.host ?? null,
-      engine: src.engine ?? null,
+      host: null,
+      engine: null,
+      provider: src.provider ?? null,
       apiKey: src.apiKey ?? null,
+      providerEndpoint: src.providerEndpoint ?? null,
+      providerProcessingAcknowledged: src.providerProcessingAcknowledged,
     });
   } catch (e: any) {
     // Surface the backend's actionable error strings (e.g. "A server URL is

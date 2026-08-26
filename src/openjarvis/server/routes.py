@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 
 from openjarvis.core.paths import get_config_dir
 from openjarvis.core.types import Message, Role, ToolCall
+from openjarvis.security.output_safety import sanitize_model_output
 from openjarvis.server.model_capabilities import is_embed_only_model
 from openjarvis.server.models import (
     ChatCompletionChunk,
@@ -523,7 +524,7 @@ def _handle_direct(
             max_tokens=req.max_tokens,
             **kwargs,
         )
-    content = result.get("content", "")
+    content = sanitize_model_output(result.get("content", ""))
     usage = result.get("usage", {})
 
     choice_msg = ChoiceMessage(role="assistant", content=content)
@@ -660,7 +661,7 @@ def _handle_agent(
             Choice(
                 message=ChoiceMessage(
                     role="assistant",
-                    content=result.content,
+                    content=sanitize_model_output(result.content),
                     audio=audio_meta,
                 ),
                 finish_reason="stop",
@@ -867,7 +868,9 @@ async def _handle_stream_tools(
                 choices=[
                     StreamChoice(
                         delta=DeltaMessage(
-                            content=f"\n\nError during generation: {exc}",
+                            content=sanitize_model_output(
+                                f"\n\nError during generation: {exc}", max_chars=2_000
+                            ),
                         ),
                         finish_reason="stop",
                     )
@@ -1008,17 +1011,10 @@ async def _handle_stream(
                         max_tokens=req.max_tokens,
                     )
             async for token in token_iter:
+                # Credentials can span multiple provider tokens. Hold raw text
+                # locally until completion so redaction cannot be bypassed by a
+                # secret split over individual SSE chunks.
                 full_content += token
-                chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    model=model,
-                    choices=[
-                        StreamChoice(
-                            delta=DeltaMessage(content=token),
-                        )
-                    ],
-                )
-                yield f"data: {chunk.model_dump_json()}\n\n"
         except Exception as exc:
             # Surface errors as a content chunk so the frontend can
             # display them instead of silently failing.
@@ -1035,7 +1031,9 @@ async def _handle_stream(
                 choices=[
                     StreamChoice(
                         delta=DeltaMessage(
-                            content=f"\n\nError during generation: {exc}",
+                            content=sanitize_model_output(
+                                f"\n\nError during generation: {exc}", max_chars=2_000
+                            ),
                         ),
                         finish_reason="stop",
                     )
@@ -1044,6 +1042,16 @@ async def _handle_stream(
             yield f"data: {error_chunk.model_dump_json()}\n\n"
             yield "data: [DONE]\n\n"
             return
+
+        safe_content = sanitize_model_output(full_content)
+        if safe_content:
+            output_chunk = ChatCompletionChunk(
+                id=chunk_id,
+                model=model,
+                choices=[StreamChoice(delta=DeltaMessage(content=safe_content))],
+            )
+            yield f"data: {output_chunk.model_dump_json()}\n\n"
+        full_content = safe_content
 
         # Record a trace for the completed stream (best-effort; never breaks
         # the response). Mirrors the agent path so streamed chats also

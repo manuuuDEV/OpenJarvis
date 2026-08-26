@@ -14,7 +14,6 @@ import { Toaster } from './components/ui/sonner';
 import { useAppStore } from './lib/store';
 import { fetchModels, fetchServerInfo, fetchSavings, submitSavings, isTauri } from './lib/api';
 import { OptInModal } from './components/OptInModal';
-import { UpdateChecker } from './components/Desktop/UpdateChecker';
 import { track, hashId } from './lib/analytics';
 
 export default function App() {
@@ -180,7 +179,6 @@ export default function App() {
 
   return (
     <>
-      <UpdateChecker />
       <Routes>
         <Route element={<Layout />}>
           <Route index element={<ChatPage />} />

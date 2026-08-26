@@ -1,15 +1,19 @@
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+mod android_adb_broker;
+#[cfg(target_os = "windows")]
+mod desktop_broker;
+
 use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
-use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Mutex;
 
 const OLLAMA_PORT: u16 = 11434;
 const JARVIS_PORT: u16 = 8000;
 const DESKTOP_UV_SYNC_COMMAND: &str =
-    "uv sync --extra desktop --extra inference-cloud --extra inference-google --group desktop-native";
+    "uv sync --extra server --extra inference-cloud --extra inference-google --group desktop-native";
 
 /// Small, fast model used when startup needs a default Ollama tag.
 const STARTUP_MODEL: &str = "qwen3.5:4b";
@@ -119,6 +123,81 @@ struct BootPlan {
 /// Default OpenAI-compatible engine key used when a custom endpoint config
 /// omits one (LM Studio is the canonical local server).
 const CUSTOM_FALLBACK_ENGINE: &str = "lmstudio";
+// Only providers explicitly exposed by the secure desktop settings are accepted.
+// A profile selects one provider at a time; this list never enables fallback.
+const CLOUD_PROVIDERS: &[&str] = &[
+    "openai",
+    "google",
+    "openrouter",
+    "groq",
+    "nvidia",
+    "sambanova",
+    "alibaba",
+    "pollinations",
+    "huggingface",
+    "together",
+];
+
+fn cloud_api_key_name(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "google" => Some("GEMINI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "groq" => Some("GROQ_API_KEY"),
+        "nvidia" => Some("NVIDIA_API_KEY"),
+        "sambanova" => Some("SAMBANOVA_API_KEY"),
+        "alibaba" => Some("DASHSCOPE_API_KEY"),
+        "pollinations" => Some("POLLINATIONS_API_KEY"),
+        "huggingface" => Some("HF_TOKEN"),
+        "together" => Some("TOGETHER_API_KEY"),
+        _ => None,
+    }
+}
+
+fn validate_cloud_provider(provider: &str) -> Result<(), String> {
+    if CLOUD_PROVIDERS.contains(&provider) {
+        Ok(())
+    } else {
+        Err(format!("Unsupported cloud provider: {:?}", provider))
+    }
+}
+
+fn provider_endpoint_required(provider: &str) -> bool {
+    matches!(provider, "sambanova" | "alibaba")
+}
+
+fn validate_provider_endpoint(provider: &str, endpoint: Option<&str>) -> Result<Option<String>, String> {
+    let endpoint = endpoint.map(str::trim).filter(|value| !value.is_empty());
+    if endpoint.is_none() && provider_endpoint_required(provider) {
+        return Err("This provider requires its HTTPS endpoint from your provider console.".into());
+    }
+    let Some(endpoint) = endpoint else {
+        // Pollinations has one documented canonical HTTPS base; no custom
+        // endpoint is exposed in Settings for this provider.
+        return if provider == "pollinations" {
+            Ok(Some("https://gen.pollinations.ai".to_string()))
+        } else {
+            Ok(None)
+        };
+    };
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|_| "Provider endpoint is not a valid URL.".to_string())?;
+    if url.scheme() != "https" || url.query().is_some() || url.fragment().is_some() {
+        return Err("Provider endpoint must be a clean HTTPS base URL.".into());
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let allowed = match provider {
+        "sambanova" => host == "api.sambanova.ai" || host.ends_with(".sambanova.ai"),
+        "alibaba" => host.ends_with(".aliyuncs.com"),
+        "pollinations" => host == "gen.pollinations.ai",
+        _ => false,
+    };
+    if !allowed {
+        return Err("Provider endpoint host is not authorized for this profile.".into());
+    }
+    Ok(Some(endpoint.trim_end_matches('/').to_string()))
+}
 
 /// Decide what to launch/pull/serve from the inference config + system RAM.
 /// Pure: no I/O, no spawning.
@@ -136,6 +215,22 @@ fn boot_plan(cfg: &InferenceConfig, ram_gb: f64) -> BootPlan {
                 serve_args: vec![
                     "--engine".into(),
                     "ollama".into(),
+                    "--model".into(),
+                    model,
+                    "--agent".into(),
+                    "simple".into(),
+                ],
+            }
+        }
+        SourceKind::Cloud => {
+            let model = cfg.model.clone().unwrap_or_default();
+            BootPlan {
+                launch_ollama: false,
+                model_to_pull: None,
+                engine_host: None,
+                serve_args: vec![
+                    "--engine".into(),
+                    "cloud".into(),
                     "--model".into(),
                     model,
                     "--agent".into(),
@@ -266,85 +361,29 @@ fn resolve_bin(name: &str) -> String {
     name.to_string()
 }
 
-/// Find the OpenJarvis project root (contains pyproject.toml).
-/// Checks OPENJARVIS_ROOT env var, walks up from the executable, then
-/// probes common clone locations.
+/// Find the reviewed backend source embedded by the secure desktop installer.
+///
+/// Development may opt in to a local source directory, but release builds never
+/// scan home directories or silently execute a nearby clone.
 fn find_project_root() -> Option<std::path::PathBuf> {
-    // 1. Explicit env var override
-    if let Ok(root) = std::env::var("OPENJARVIS_ROOT") {
-        let path = std::path::PathBuf::from(&root);
-        if path.join("pyproject.toml").exists() {
-            return Some(path);
-        }
-    }
-
-    // 2. Walk up from the running executable (works in dev and .app bundle)
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent().map(|p| p.to_path_buf());
-        for _ in 0..8 {
-            if let Some(ref d) = dir {
-                if d.join("pyproject.toml").exists() {
-                    return Some(d.clone());
-                }
-                dir = d.parent().map(|p| p.to_path_buf());
+    // Explicit development-only override. The installed profile never sets the
+    // enabling flag, so a user environment variable cannot replace the bundled
+    // backend with arbitrary local source during normal desktop use.
+    if std::env::var("OPENJARVIS_ALLOW_DEVELOPMENT_SOURCE").ok().as_deref() == Some("1") {
+        if let Ok(root) = std::env::var("OPENJARVIS_ROOT") {
+            let path = std::path::PathBuf::from(&root);
+            if path.join("pyproject.toml").exists() {
+                return Some(path);
             }
         }
     }
 
-    // 3. Fallback: well-known direct paths
-    let home = home_dir();
-    let direct = [
-        format!("{home}/OpenJarvis"),
-        format!("{home}/projects/hazy/OpenJarvis"),
-        format!("{home}/projects/OpenJarvis"),
-        format!("{home}/src/OpenJarvis"),
-        format!("{home}/Documents/OpenJarvis"),
-        format!("{home}/Desktop/OpenJarvis"),
-        format!("{home}/Developer/OpenJarvis"),
-        format!("{home}/dev/OpenJarvis"),
-        format!("{home}/Code/OpenJarvis"),
-        format!("{home}/code/OpenJarvis"),
-        format!("{home}/repos/OpenJarvis"),
-        format!("{home}/github/OpenJarvis"),
-    ];
-    for p in &direct {
-        let path = std::path::PathBuf::from(p);
-        if path.join("pyproject.toml").exists() {
-            return Some(path);
-        }
-    }
-
-    // 4. Shallow scan: look for OpenJarvis one level inside common parent dirs.
-    //    This catches clones like ~/Documents/my-stuff/OpenJarvis without
-    //    needing to enumerate every possible intermediate folder.
-    let scan_parents = [
-        format!("{home}/Documents"),
-        format!("{home}/Desktop"),
-        format!("{home}/Developer"),
-        format!("{home}/projects"),
-        format!("{home}/repos"),
-        format!("{home}/src"),
-        format!("{home}/Code"),
-        format!("{home}/code"),
-        format!("{home}/dev"),
-        format!("{home}/github"),
-    ];
-    for parent in &scan_parents {
-        let parent_path = std::path::PathBuf::from(parent);
-        if let Ok(entries) = std::fs::read_dir(&parent_path) {
-            for entry in entries.flatten() {
-                let candidate = entry.path().join("OpenJarvis");
-                if candidate.join("pyproject.toml").exists() {
-                    return Some(candidate);
-                }
-                // Also check if the entry itself is OpenJarvis (case-insensitive match)
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.eq_ignore_ascii_case("openjarvis")
-                        && entry.path().join("pyproject.toml").exists()
-                    {
-                        return Some(entry.path());
-                    }
-                }
+    // The source tree embedded by the secure desktop installer.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let bundled_source = exe_dir.join("resources").join("openjarvis-source");
+            if bundled_source.join("pyproject.toml").exists() {
+                return Some(bundled_source);
             }
         }
     }
@@ -925,6 +964,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         s.source = match cfg.kind {
             SourceKind::Ollama => "ollama",
             SourceKind::Custom => "custom",
+            SourceKind::Cloud => "cloud",
         }
         .into();
     }
@@ -1051,8 +1091,47 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
             s.model_ready = true;
             s.detail = "Model ready.".into();
         }
+    } else if cfg.kind == SourceKind::Cloud {
+        let provider = cfg.provider.clone().unwrap_or_default();
+        let model = cfg.model.clone().unwrap_or_default();
+        if provider.is_empty() || model.is_empty() {
+            let mut s = status.lock().await;
+            s.error = Some(
+                "Choose one authorized cloud provider and model in Settings before starting OpenJarvis."
+                    .into(),
+            );
+            return;
+        }
+        if let Err(error) = validate_cloud_provider(&provider) {
+            let mut s = status.lock().await;
+            s.error = Some(error);
+            return;
+        }
+        let Some(key_name) = cloud_api_key_name(&provider) else {
+            let mut s = status.lock().await;
+            s.error = Some("The selected cloud provider has no supported credential mapping.".into());
+            return;
+        };
+        if !matches!(secure_store_get(key_name), Ok(Some(value)) if !value.is_empty()) {
+            let mut s = status.lock().await;
+            s.error = Some(format!(
+                "Add the API key for the authorized provider ({}) in Settings before starting OpenJarvis.",
+                provider
+            ));
+            return;
+        }
+        if let Err(error) = set_cloud_privacy_config(&provider) {
+            let mut s = status.lock().await;
+            s.error = Some(error);
+            return;
+        }
+        let mut s = status.lock().await;
+        s.phase = "model".into();
+        s.ollama_ready = true;
+        s.model_ready = true;
+        s.detail = format!("Cloud provider {} authorized with TLS required.", provider);
     } else {
-        // Custom OpenAI-compatible endpoint: never start Ollama, never download.
+        // Legacy custom endpoint: never start Ollama, never download.
         let host = plan
             .engine_host
             .as_ref()
@@ -1129,90 +1208,16 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         return;
     }
 
-    let mut project_root = find_project_root();
+    let project_root = find_project_root();
 
     if project_root.is_none() {
-        // Auto-clone on first launch
-        let git_bin = resolve_bin("git");
-
-        // Check that git is installed
-        if !std::path::Path::new(&git_bin).exists() && git_bin == "git" {
-            let mut s = status.lock().await;
-            s.error = Some(
-                "Could not find 'git'. \
-                 Install it from https://git-scm.com then relaunch."
-                    .into(),
-            );
-            return;
-        }
-
-        let target_path = std::path::PathBuf::from(home_dir()).join("OpenJarvis");
-        let clone_target = target_path.display().to_string();
-
-        // If the directory exists but is not a valid project, don't overwrite
-        if target_path.exists() && !target_path.join("pyproject.toml").exists() {
-            let mut s = status.lock().await;
-            s.error = Some(format!(
-                "{} exists but is not a valid OpenJarvis project. \
-                 Remove it and relaunch, or set OPENJARVIS_ROOT to the correct path.",
-                clone_target,
-            ));
-            return;
-        }
-
-        {
-            let mut s = status.lock().await;
-            s.detail = "Downloading OpenJarvis (first launch)...".into();
-        }
-
-        let clone_result = tokio::process::Command::new(&git_bin)
-            .args([
-                "clone",
-                "--depth",
-                "1",
-                "https://github.com/open-jarvis/OpenJarvis.git",
-                &clone_target,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-
-        match clone_result {
-            Ok(child) => match child.wait_with_output().await {
-                Ok(output) if output.status.success() => {
-                    project_root = Some(target_path);
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let mut s = status.lock().await;
-                    s.error = Some(format!(
-                        "Failed to download OpenJarvis: {}. \
-                         Clone manually: git clone https://github.com/open-jarvis/OpenJarvis.git {}",
-                        stderr.trim(),
-                        clone_target,
-                    ));
-                    return;
-                }
-                Err(e) => {
-                    let mut s = status.lock().await;
-                    s.error = Some(format!(
-                        "Failed to download OpenJarvis: {}. \
-                         Clone manually: git clone https://github.com/open-jarvis/OpenJarvis.git {}",
-                        e, clone_target,
-                    ));
-                    return;
-                }
-            },
-            Err(e) => {
-                let mut s = status.lock().await;
-                s.error = Some(format!(
-                    "Could not run git: {}. \
-                     Install git from https://git-scm.com then relaunch.",
-                    e,
-                ));
-                return;
-            }
-        }
+        let mut s = status.lock().await;
+        s.error = Some(
+            "The verified backend resource bundled with this desktop app was not found. \
+             Reinstall the matching package; do not point the app to an arbitrary local clone."
+                .into(),
+        );
+        return;
     }
 
     // If something is already serving on our port, decide what to do based
@@ -1351,7 +1356,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     sync_cmd
         .args([
             "sync",
-            "--extra", "desktop",
+            "--extra", "server",
             "--extra", "inference-cloud",
             "--extra", "inference-google",
             // openjarvis_rust lives in a uv dependency group (not the published
@@ -1426,7 +1431,57 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     // additions aren't accidentally stripped.
     prepare_subprocess_for_appimage(&mut cmd);
 
-    // Inject cloud API keys from secure desktop storage.
+    // Enable only the bounded, approval-gated local actions. This is distinct
+    // from OPENJARVIS_ENABLE_DANGEROUS_TOOLS, which remains unset.
+    cmd.env("OPENJARVIS_ENABLE_CONTROLLED_LOCAL_ACTIONS", "1");
+    // The model can only propose structured UI plans. A separate native broker
+    // validates the user-approved plan before any Windows UI Automation action.
+    cmd.env("OPENJARVIS_ENABLE_CONTROLLED_DESKTOP_OPERATOR", "1");
+    // Android diagnostics are a separate, read-only and approval-gated broker.
+    // The backend receives no ADB binary path or Android serial number.
+    cmd.env("OPENJARVIS_ENABLE_CONTROLLED_ANDROID_ADB", "1");
+
+    #[cfg(target_os = "windows")]
+    let desktop_broker_token = match desktop_broker::launch_token() {
+        Ok(token) => token,
+        Err(error) => {
+            let mut s = status.lock().await;
+            s.error = Some(error);
+            return;
+        }
+    };
+    #[cfg(target_os = "windows")]
+    cmd.env("OPENJARVIS_DESKTOP_BROKER_TOKEN", &desktop_broker_token);
+
+    #[cfg(target_os = "windows")]
+    let android_adb_broker_token = match android_adb_broker::launch_token() {
+        Ok(token) => token,
+        Err(error) => {
+            let mut s = status.lock().await;
+            s.error = Some(error);
+            return;
+        }
+    };
+    #[cfg(target_os = "windows")]
+    cmd.env("OPENJARVIS_ANDROID_ADB_BROKER_TOKEN", &android_adb_broker_token);
+
+    // Do not inherit cloud credentials from the desktop process. The backend
+    // receives only the explicitly selected inference credential below.
+    for key_name in MANAGED_CLOUD_KEY_NAMES {
+        cmd.env_remove(key_name);
+    }
+    cmd.env_remove("MINIMAX_API_KEY");
+    cmd.env("OPENJARVIS_SECURE_DESKTOP_PROFILE", "1");
+
+    // The backend receives only the explicitly selected provider identity and
+    // its one credential. No inactive profile is exposed to the process.
+    if let Some(provider) = cfg.provider.as_deref() {
+        cmd.env("OPENJARVIS_CLOUD_PROVIDER", provider);
+    }
+    if let Some(endpoint) = cfg.provider_endpoint.as_deref() {
+        cmd.env("OPENJARVIS_CLOUD_PROVIDER_ENDPOINT", endpoint);
+    }
+    // Inject only the selected cloud API key from secure desktop storage.
     for (key, value) in read_cloud_keys() {
         cmd.env(&key, &value);
     }
@@ -1539,6 +1594,11 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         s.detail = "All systems ready.".into();
     }
 
+    #[cfg(target_os = "windows")]
+    desktop_broker::spawn_worker(desktop_broker_token, api_base());
+    #[cfg(target_os = "windows")]
+    android_adb_broker::spawn_worker(android_adb_broker_token, api_base());
+
     // Phase 4: done. We intentionally do NOT auto-pull the rest of the
     // Qwen3.5 ladder here. The previous behavior walked every model that
     // "fit" in RAM (up to qwen3.5:122b ≈ 81 GB) and pulled each one in an
@@ -1600,6 +1660,203 @@ async fn check_health(api_url: String) -> Result<serde_json::Value, String> {
     resp.json()
         .await
         .map_err(|e| format!("Invalid response: {}", e))
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SecureSelfTestCheck {
+    id: String,
+    status: String,
+    title: String,
+    detail: String,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SecureSelfTestReport {
+    checks: Vec<SecureSelfTestCheck>,
+    passed: usize,
+    warnings: usize,
+    live_checks_required: usize,
+}
+
+fn secure_self_test_check(
+    id: &str,
+    status: &str,
+    title: &str,
+    detail: &str,
+) -> SecureSelfTestCheck {
+    SecureSelfTestCheck {
+        id: id.to_string(),
+        status: status.to_string(),
+        title: title.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn secure_self_test_report(checks: Vec<SecureSelfTestCheck>) -> SecureSelfTestReport {
+    let passed = checks.iter().filter(|check| check.status == "pass").count();
+    let warnings = checks
+        .iter()
+        .filter(|check| matches!(check.status.as_str(), "warning" | "not_configured"))
+        .count();
+    let live_checks_required = checks
+        .iter()
+        .filter(|check| check.status == "live_check_required")
+        .count();
+    SecureSelfTestReport {
+        checks,
+        passed,
+        warnings,
+        live_checks_required,
+    }
+}
+
+/// Report local-only. It deliberately does not start a broker, invoke ADB,
+/// launch a browser, enumerate windows, or send cloud traffic.
+#[tauri::command]
+async fn run_secure_self_test() -> Result<SecureSelfTestReport, String> {
+    let mut checks = Vec::new();
+    let inference = read_inference_config();
+
+    if inference.kind != SourceKind::Cloud {
+        checks.push(secure_self_test_check(
+            "cloud-profile",
+            "warning",
+            "Profilo cloud",
+            "Il profilo desktop sicuro richiede un provider cloud esplicito.",
+        ));
+    } else if let Some(provider) = inference.provider.as_deref() {
+        let key_present = cloud_api_key_name(provider)
+            .and_then(|key_name| secure_store_get(key_name).ok().flatten())
+            .is_some_and(|value| !value.is_empty());
+        if !inference.provider_processing_acknowledged {
+            checks.push(secure_self_test_check(
+                "cloud-provider-consent",
+                "warning",
+                "Consenso provider cloud",
+                "Conferma nelle Impostazioni che il provider selezionato riceve e processa prompt e risposte tramite TLS.",
+            ));
+        } else if key_present {
+            checks.push(secure_self_test_check(
+                "cloud-provider",
+                "pass",
+                "Provider cloud",
+                "Il provider selezionato ha una credenziale nel portachiavi del sistema operativo.",
+            ));
+        } else {
+            checks.push(secure_self_test_check(
+                "cloud-provider-key",
+                "warning",
+                "Credenziale provider cloud",
+                "Manca la credenziale del provider selezionato nel portachiavi del sistema operativo.",
+            ));
+        }
+    } else {
+        checks.push(secure_self_test_check(
+            "cloud-provider",
+            "not_configured",
+            "Provider cloud",
+            "Seleziona un provider cloud nelle Impostazioni prima di usare la chat.",
+        ));
+    }
+
+    let backend_url = format!("{}/health", api_base());
+    let backend_healthy = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .map_err(|_| "Unable to create the local health client.")?
+        .get(&backend_url)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success());
+    checks.push(if backend_healthy {
+        secure_self_test_check(
+            "backend-health",
+            "pass",
+            "Backend locale",
+            "Il backend locale risponde al controllo health.",
+        )
+    } else {
+        secure_self_test_check(
+            "backend-health",
+            "warning",
+            "Backend locale",
+            "Il backend locale non risponde ancora. Attendi l’avvio o riavvia l’app.",
+        )
+    });
+
+    let transcription = read_transcription_config();
+    let transcription_enabled = transcription.provider.as_deref() == Some(GROQ_TRANSCRIPTION_PROVIDER)
+        && transcription.processing_acknowledged;
+    let groq_key_present = matches!(secure_store_get("GROQ_API_KEY"), Ok(Some(value)) if !value.is_empty());
+    checks.push(if transcription_enabled && groq_key_present {
+        secure_self_test_check(
+            "voice-transcription",
+            "pass",
+            "Trascrizione vocale",
+            "Groq Whisper è configurato; il test non registra né invia audio.",
+        )
+    } else {
+        secure_self_test_check(
+            "voice-transcription",
+            "not_configured",
+            "Trascrizione vocale",
+            "Groq Whisper non è configurato completamente. Il test non registra né invia audio.",
+        )
+    });
+
+    let adb = read_android_adb_config();
+    let adb_ready = adb.diagnostics_acknowledged
+        && adb.adb_path.as_deref().is_some_and(|path| std::path::Path::new(path).is_file())
+        && adb.device_serial.as_deref().is_some_and(is_safe_android_adb_serial);
+    checks.push(if adb_ready {
+        secure_self_test_check(
+            "android-adb",
+            "live_check_required",
+            "Diagnostica Android ADB",
+            "Configurazione rilevata. Collega e autorizza un Android reale per la verifica manuale; questo test non invia comandi ADB.",
+        )
+    } else {
+        secure_self_test_check(
+            "android-adb",
+            "not_configured",
+            "Diagnostica Android ADB",
+            "Non configurata. Il test non cerca dispositivi e non avvia ADB.",
+        )
+    });
+
+    checks.push(secure_self_test_check(
+        "browser-policy",
+        "pass",
+        "Browser controllato",
+        "Nel profilo desktop sicuro, lettura HTTPS e ricerca sono consentite; login, credenziali, pagamenti, invii, eliminazioni e URL sensibili sono bloccati localmente.",
+    ));
+    checks.push(secure_self_test_check(
+        "windows-ui-automation",
+        "live_check_required",
+        "Broker Windows UI Automation",
+        "Richiede build e prova manuale su Windows con una finestra non sensibile; questo test non controlla finestre né inserisce testo.",
+    ));
+    let gemini_live_enabled = read_gemini_live_config().processing_acknowledged;
+    let gemini_key_present = matches!(secure_store_get("GEMINI_API_KEY"), Ok(Some(value)) if !value.is_empty());
+    checks.push(if gemini_live_enabled && gemini_key_present {
+        secure_self_test_check(
+            "gemini-live",
+            "live_check_required",
+            "Gemini Live",
+            "Configurazione pronta. Richiede prova manuale con microfono, rete e account Google; il test non crea token né invia audio.",
+        )
+    } else {
+        secure_self_test_check(
+            "gemini-live",
+            "not_configured",
+            "Gemini Live",
+            "Non configurato. Salva una chiave Gemini e il consenso separato nelle Impostazioni prima di una prova manuale.",
+        )
+    });
+
+    Ok(secure_self_test_report(checks))
 }
 
 #[tauri::command]
@@ -1761,94 +2018,6 @@ async fn fetch_models(api_url: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn run_jarvis_command(args: Vec<String>) -> Result<String, String> {
-    let uv_bin = resolve_bin("uv");
-
-    let mut cmd_args = vec!["run".to_string(), "jarvis".to_string()];
-    cmd_args.extend(args.iter().cloned());
-
-    let mut cmd = tokio::process::Command::new(&uv_bin);
-    cmd.args(&cmd_args);
-    // Run from the project root so `uv run jarvis` resolves the OpenJarvis
-    // project regardless of the app's launch cwd. In a packaged install the
-    // cwd isn't the checkout, so without this `jarvis` isn't found and the
-    // backend never starts — the UI then shows "Failed to get response"
-    // (see #531).
-    if let Some(ref root) = find_project_root() {
-        cmd.current_dir(root);
-    }
-
-    let is_serve = args.first().map(|a| a.as_str() == "serve").unwrap_or(false);
-
-    if !is_serve {
-        // Short-lived command (e.g. `stop`, `status`): wait for it and return
-        // its captured output.
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("Failed to launch jarvis: {}", e))?;
-        return if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
-        };
-    }
-
-    // `jarvis serve` is a long-running server that never exits. The old code
-    // used `.output()`, which waits for the process to exit and so hung this
-    // command forever — the "Start" button never resolved (#531). Spawn it
-    // detached instead, drain stderr (a full 4 KB Windows pipe can otherwise
-    // stall the child mid-startup, #309), and poll /health for readiness.
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to launch jarvis serve: {}", e))?;
-
-    let tail: StderrTail = Arc::new(Mutex::new(Vec::new()));
-    if let Some(stderr) = child.stderr.take() {
-        spawn_jarvis_stderr_drainer(stderr, tail.clone());
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
-    let url = format!("http://127.0.0.1:{}/health", JARVIS_PORT);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-
-    loop {
-        // Surface an early crash (bad venv, missing Rust ext, etc.) right away
-        // instead of waiting out the full readiness timeout.
-        if let Ok(Some(status)) = child.try_wait() {
-            let stderr = String::from_utf8_lossy(tail.lock().await.as_slice()).into_owned();
-            return Err(format!(
-                "jarvis serve exited (code {:?}) before becoming healthy:\n{}",
-                status.code(),
-                stderr.trim()
-            ));
-        }
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                // Leave the server running (the Child is detached on drop —
-                // kill_on_drop defaults to false); `stop` tears it down.
-                return Ok(format!(
-                    "jarvis serve is ready on http://127.0.0.1:{}",
-                    JARVIS_PORT
-                ));
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "jarvis serve did not become healthy on port {} within 120s.",
-                JARVIS_PORT
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-#[tauri::command]
 async fn fetch_savings(api_url: String) -> Result<serde_json::Value, String> {
     let base = if api_url.is_empty() {
         api_base()
@@ -1863,52 +2032,75 @@ async fn fetch_savings(api_url: String) -> Result<serde_json::Value, String> {
         .map_err(|e| format!("Invalid response: {}", e))
 }
 
-/// Transcribe audio via the speech API endpoint.
+/// Transcribe a user-recorded file through the explicitly enabled Groq
+/// provider. The renderer never receives the credential and the Python chat
+/// backend is not given this separate speech credential.
 #[tauri::command]
 async fn transcribe_audio(
-    api_url: String,
+    _api_url: String,
     audio_data: Vec<u8>,
     filename: String,
 ) -> Result<serde_json::Value, String> {
-    let url = format!("{}/v1/speech/transcribe", api_url);
-    let client = reqwest::Client::new();
+    let cfg = read_transcription_config();
+    if cfg.provider.as_deref() != Some(GROQ_TRANSCRIPTION_PROVIDER)
+        || !cfg.processing_acknowledged
+    {
+        return Err("Groq Whisper transcription is not enabled in Settings.".into());
+    }
+    if audio_data.is_empty() {
+        return Err("The recording is empty.".into());
+    }
+    if audio_data.len() > MAX_TRANSCRIPTION_AUDIO_BYTES {
+        return Err("The recording exceeds the 25 MB transcription upload limit.".into());
+    }
+    let extension = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime_type = match extension.as_str() {
+        "webm" => "audio/webm",
+        "wav" => "audio/wav",
+        "mp3" | "mpga" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "mp4" => "video/mp4",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        _ => return Err("This recording format is not supported by Groq Whisper.".into()),
+    };
+    let api_key = secure_store_get("GROQ_API_KEY")?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Save a Groq API key in Settings before transcribing audio.".to_string())?;
 
     let part = reqwest::multipart::Part::bytes(audio_data)
-        .file_name(filename)
-        .mime_str("audio/webm")
-        .map_err(|e| format!("Failed to create multipart: {}", e))?;
-
-    let form = reqwest::multipart::Form::new().part("file", part);
-
-    let resp = client
-        .post(&url)
+        .file_name(format!("recording.{}", extension))
+        .mime_str(mime_type)
+        .map_err(|_| "Unable to prepare the recording for transcription.")?;
+    let form = reqwest::multipart::Form::new()
+        .text("model", cfg.model)
+        .text("response_format", "verbose_json")
+        .part("file", part);
+    let response = reqwest::Client::new()
+        .post("https://api.groq.com/openai/v1/audio/transcriptions")
+        .bearer_auth(api_key)
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("Connection failed: {}", e))?;
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("Invalid response: {}", e))?;
+        .map_err(|_| "Unable to contact the selected transcription provider.")?;
+    let status = response.status();
     if !status.is_success() {
-        let detail = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("detail")
-                    .and_then(|detail| detail.as_str())
-                    .map(str::to_string)
-            })
-            .filter(|detail| !detail.is_empty())
-            .unwrap_or(body);
-        return Err(format!(
-            "Transcription failed ({}): {}",
-            status.as_u16(),
-            detail
-        ));
+        return Err(format!("The transcription provider rejected the recording (HTTP {}).", status.as_u16()));
     }
-    serde_json::from_str(&body).map_err(|e| format!("Invalid response: {}", e))
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "The transcription provider returned an invalid response.")?;
+    Ok(serde_json::json!({
+        "text": body.get("text").and_then(|value| value.as_str()).unwrap_or_default(),
+        "language": body.get("language").and_then(|value| value.as_str()),
+        "confidence": serde_json::Value::Null,
+        "duration_seconds": body.get("duration").and_then(|value| value.as_f64()).unwrap_or(0.0),
+    }))
 }
 
 /// Submit savings to Supabase leaderboard.
@@ -1949,7 +2141,14 @@ const MANAGED_CLOUD_KEY_NAMES: &[&str] = &[
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     "OPENROUTER_API_KEY",
-    "MINIMAX_API_KEY",
+    "GROQ_API_KEY",
+    "NVIDIA_API_KEY",
+    "SAMBANOVA_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "POLLINATIONS_API_KEY",
+    "HF_TOKEN",
+    "TOGETHER_API_KEY",
+    "PICOVOICE_ACCESS_KEY",
     "TAVILY_API_KEY",
 ];
 
@@ -1964,7 +2163,8 @@ fn legacy_cloud_keys_path() -> std::path::PathBuf {
 fn validate_cloud_key_name(key_name: &str) -> Result<(), String> {
     let valid = !key_name.is_empty()
         && key_name.len() <= 128
-        && key_name.ends_with("_API_KEY")
+        && (key_name.ends_with("_API_KEY")
+            || matches!(key_name, "HF_TOKEN" | "PICOVOICE_ACCESS_KEY"))
         && key_name
             .chars()
             .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
@@ -2089,43 +2289,32 @@ fn migrate_legacy_cloud_keys() {
     }
 }
 
-/// Read cloud keys from secure desktop storage and return key=value pairs.
+/// Read only the key explicitly authorized for the active cloud profile.
 fn read_cloud_keys() -> Vec<(String, String)> {
     migrate_legacy_cloud_keys();
-    managed_cloud_key_names()
-        .into_iter()
-        .filter_map(|key| match secure_store_get(&key) {
-            Ok(Some(value)) if !value.is_empty() => Some((key, value)),
-            _ => None,
-        })
-        .collect()
-}
-
-async fn reload_cloud_keys(keys: Vec<(String, String)>) {
-    let reload_url = format!("http://127.0.0.1:{}/v1/cloud/reload", JARVIS_PORT);
-    let key_map: serde_json::Map<String, serde_json::Value> = keys
-        .into_iter()
-        .map(|(key, value)| (key, serde_json::Value::String(value)))
-        .collect();
-    let _ = reqwest::Client::new()
-        .post(&reload_url)
-        .json(&serde_json::json!({ "keys": key_map }))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await;
+    let config = read_inference_config();
+    if !config.provider_processing_acknowledged {
+        return Vec::new();
+    }
+    let provider = config.provider.unwrap_or_default();
+    let Some(key_name) = cloud_api_key_name(&provider) else {
+        return Vec::new();
+    };
+    match secure_store_get(key_name) {
+        Ok(Some(value)) if !value.is_empty() => vec![(key_name.to_string(), value)],
+        _ => Vec::new(),
+    }
 }
 
 /// Save a single cloud API key to secure desktop storage.
+///
+/// The key takes effect after a restart. This avoids sending a newly saved
+/// credential to an already-running backend that was started for another
+/// profile, and therefore preserves single-profile key isolation.
 #[tauri::command]
 async fn save_cloud_key(key_name: String, key_value: String) -> Result<(), String> {
     let key_value = key_value.trim().to_string();
-    secure_store_set(&key_name, &key_value)?;
-
-    // Tell the running server to hot-reload its cloud engine so the user
-    // doesn't need to restart the app after entering an API key.
-    reload_cloud_keys(vec![(key_name, key_value)]).await;
-
-    Ok(())
+    secure_store_set(&key_name, &key_value)
 }
 
 /// Get which cloud providers have keys configured (without exposing values).
@@ -2155,72 +2344,48 @@ async fn get_inference_source() -> Result<InferenceConfig, String> {
 async fn set_inference_source(
     kind: String,
     model: Option<String>,
-    host: Option<String>,
-    engine: Option<String>,
+    _host: Option<String>,
+    _engine: Option<String>,
+    provider: Option<String>,
     api_key: Option<String>,
+    provider_endpoint: Option<String>,
+    provider_processing_acknowledged: bool,
 ) -> Result<(), String> {
-    let kind = match kind.as_str() {
-        "ollama" => SourceKind::Ollama,
-        "custom" => SourceKind::Custom,
-        other => return Err(format!("Unknown inference source kind: {:?}", other)),
-    };
+    if kind != "cloud" {
+        return Err("This desktop distribution permits only an explicitly authorized cloud provider.".into());
+    }
+    if !provider_processing_acknowledged {
+        return Err(
+            "Confirm that TLS protects data in transit while the selected provider processes prompts and responses before saving a cloud profile."
+                .into(),
+        );
+    }
+    let provider = provider.unwrap_or_default().trim().to_ascii_lowercase();
+    validate_cloud_provider(&provider)?;
+    let provider_endpoint = validate_provider_endpoint(&provider, provider_endpoint.as_deref())?;
+    let model = model.unwrap_or_default().trim().to_string();
+    if model.is_empty() {
+        return Err("A cloud model is required.".into());
+    }
+    let key_name = cloud_api_key_name(&provider)
+        .ok_or_else(|| "The selected provider has no supported credential mapping.".to_string())?;
+    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+        save_cloud_key(key_name.to_string(), key)
+            .await
+            .map_err(|e| format!("Could not store the API key: {}", e))?;
+    } else if !matches!(secure_store_get(key_name), Ok(Some(value)) if !value.is_empty()) {
+        return Err("An API key for the selected provider is required and is stored only in the operating-system credential store.".into());
+    }
     let cfg = InferenceConfig {
-        kind,
-        model: model.filter(|m| !m.is_empty()),
-        host: host.map(|h| normalize_host(&h)).filter(|h| !h.is_empty()),
-        engine: engine.filter(|e| !e.is_empty()),
+        kind: SourceKind::Cloud,
+        model: Some(model),
+        host: None,
+        engine: None,
+        provider: Some(provider),
+        provider_endpoint,
+        provider_processing_acknowledged: true,
     };
-    if let SourceKind::Custom = cfg.kind {
-        if cfg.host.is_none() {
-            return Err("A server URL is required for a custom endpoint.".into());
-        }
-        if cfg.model.as_deref().unwrap_or("").is_empty() {
-            return Err("A model name is required for a custom endpoint.".into());
-        }
-        if let Some(key) = api_key.filter(|k| !k.is_empty()) {
-            let engine = cfg
-                .engine
-                .clone()
-                .unwrap_or_else(|| CUSTOM_FALLBACK_ENGINE.to_string());
-            let key_name = engine_api_key_name(&engine);
-            // Save the key before persisting the config: if the key can't be
-            // written, surface it and DON'T record a custom source whose
-            // credential is missing (which would fail confusingly at runtime).
-            save_cloud_key(key_name, key)
-                .await
-                .map_err(|e| format!("Could not store the API key: {}", e))?;
-        }
-    }
     write_inference_config(&cfg)
-}
-
-/// Pull a model via Ollama (called from frontend download button).
-#[tauri::command]
-async fn pull_ollama_model(model_name: String) -> Result<serde_json::Value, String> {
-    pull_model(&model_name)
-        .await
-        .map_err(|e| format!("Failed to pull {}: {}", model_name, e))?;
-    Ok(serde_json::json!({"status": "ok", "model": model_name}))
-}
-
-/// Delete a model from Ollama.
-#[tauri::command]
-async fn delete_ollama_model(model_name: String) -> Result<serde_json::Value, String> {
-    let url = format!("http://127.0.0.1:{}/api/delete", OLLAMA_PORT);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .delete(&url)
-        .json(&serde_json::json!({"name": model_name}))
-        .send()
-        .await
-        .map_err(|e| format!("Delete failed: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("Delete returned status {}", resp.status()));
-    }
-    Ok(serde_json::json!({"status": "deleted", "model": model_name}))
 }
 
 // ---------------------------------------------------------------------------
@@ -2232,11 +2397,12 @@ async fn delete_ollama_model(model_name: String) -> Result<serde_json::Value, St
 enum SourceKind {
     Ollama,
     Custom,
+    Cloud,
 }
 
 impl Default for SourceKind {
     fn default() -> Self {
-        SourceKind::Ollama
+        SourceKind::Cloud
     }
 }
 
@@ -2252,6 +2418,15 @@ struct InferenceConfig {
     /// OpenAI-compatible engine key (e.g. "lmstudio"), custom only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     engine: Option<String>,
+    /// Explicit cloud provider allowlisted for this desktop profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    /// Optional approved provider endpoint for regional/provider-console routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_endpoint: Option<String>,
+    /// User acknowledgement that a normal cloud provider processes plaintext.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    provider_processing_acknowledged: bool,
 }
 
 /// Path to the inference-source config (~/.openjarvis/inference.json).
@@ -2261,13 +2436,512 @@ fn inference_config_path() -> std::path::PathBuf {
         .join("inference.json")
 }
 
-/// Parse config text. Any error (missing/garbage) yields the Ollama default —
-/// a broken file must never strand the user with no working inference source.
-fn parse_inference_config(text: &str) -> InferenceConfig {
-    serde_json::from_str::<InferenceConfig>(text).unwrap_or_default()
+const GROQ_TRANSCRIPTION_PROVIDER: &str = "groq-whisper";
+const GROQ_TRANSCRIPTION_MODELS: &[&str] = &["whisper-large-v3-turbo", "whisper-large-v3"];
+const MAX_TRANSCRIPTION_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+
+/// Transcription settings never contain API keys; the Groq credential is read
+/// only by the native command at the moment an approved recording is sent.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct TranscriptionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(default = "default_groq_transcription_model")]
+    model: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    processing_acknowledged: bool,
 }
 
-/// Read the on-disk inference config, or the Ollama default if absent.
+fn default_groq_transcription_model() -> String {
+    "whisper-large-v3-turbo".to_string()
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: default_groq_transcription_model(),
+            processing_acknowledged: false,
+        }
+    }
+}
+
+fn transcription_config_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(home_dir())
+        .join(".openjarvis")
+        .join("transcription.json")
+}
+
+fn read_transcription_config() -> TranscriptionConfig {
+    std::fs::read_to_string(transcription_config_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<TranscriptionConfig>(&text).ok())
+        .filter(|cfg| {
+            cfg.provider.as_deref() == Some(GROQ_TRANSCRIPTION_PROVIDER)
+                && GROQ_TRANSCRIPTION_MODELS.contains(&cfg.model.as_str())
+        })
+        .unwrap_or_default()
+}
+
+fn write_transcription_config(cfg: &TranscriptionConfig) -> Result<(), String> {
+    let path = transcription_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "Unable to create the local settings directory.")?;
+    }
+    let json = serde_json::to_string_pretty(cfg)
+        .map_err(|_| "Unable to encode transcription settings.")?;
+    std::fs::write(path, json + "\n")
+        .map_err(|_| "Unable to save transcription settings.".to_string())
+}
+
+#[tauri::command]
+async fn get_transcription_source() -> Result<TranscriptionConfig, String> {
+    Ok(read_transcription_config())
+}
+
+#[tauri::command]
+async fn set_transcription_source(
+    provider: Option<String>,
+    model: Option<String>,
+    processing_acknowledged: bool,
+) -> Result<(), String> {
+    let provider = provider.unwrap_or_default().trim().to_ascii_lowercase();
+    if provider.is_empty() {
+        return write_transcription_config(&TranscriptionConfig::default());
+    }
+    if provider != GROQ_TRANSCRIPTION_PROVIDER {
+        return Err("Only Groq Whisper is available as a cloud transcription provider in this desktop profile.".into());
+    }
+    if !processing_acknowledged {
+        return Err("Confirm that the selected transcription provider receives the recorded audio over TLS and processes it before enabling transcription.".into());
+    }
+    let model = model.unwrap_or_else(default_groq_transcription_model);
+    if !GROQ_TRANSCRIPTION_MODELS.contains(&model.as_str()) {
+        return Err("The selected Groq transcription model is not supported by this desktop profile.".into());
+    }
+    if !matches!(secure_store_get("GROQ_API_KEY"), Ok(Some(value)) if !value.is_empty()) {
+        return Err("Save a Groq API key in the operating-system credential store before enabling transcription.".into());
+    }
+    write_transcription_config(&TranscriptionConfig {
+        provider: Some(provider),
+        model,
+        processing_acknowledged: true,
+    })
+}
+
+#[tauri::command]
+async fn get_transcription_status() -> Result<serde_json::Value, String> {
+    let cfg = read_transcription_config();
+    let enabled = cfg.provider.as_deref() == Some(GROQ_TRANSCRIPTION_PROVIDER)
+        && cfg.processing_acknowledged;
+    let key_set = matches!(secure_store_get("GROQ_API_KEY"), Ok(Some(value)) if !value.is_empty());
+    let available = enabled && key_set;
+    let reason = if available {
+        None
+    } else if !enabled {
+        Some("Enable Groq Whisper and confirm audio processing in Settings.".to_string())
+    } else {
+        Some("Save a Groq API key in Settings.".to_string())
+    };
+    Ok(serde_json::json!({
+        "available": available,
+        "backend": if available { Some(GROQ_TRANSCRIPTION_PROVIDER) } else { None::<&str> },
+        "reason": reason,
+        "model": cfg.model,
+    }))
+}
+
+const GEMINI_LIVE_MODEL: &str = "gemini-3.1-flash-live-preview";
+const GEMINI_LIVE_TOKEN_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/auth_tokens";
+
+/// Live settings never contain the Gemini key. The temporary session token is
+/// minted only on an explicit renderer request and is not persisted by native
+/// code or forwarded to the Python backend.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct GeminiLiveConfig {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    processing_acknowledged: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GeminiLiveSessionToken {
+    access_token: String,
+    expires_at: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiLiveTokenResponse {
+    name: String,
+    expire_time: Option<String>,
+}
+
+fn gemini_live_config_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(home_dir())
+        .join(".openjarvis")
+        .join("gemini-live.json")
+}
+
+fn read_gemini_live_config() -> GeminiLiveConfig {
+    std::fs::read_to_string(gemini_live_config_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<GeminiLiveConfig>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_gemini_live_config(config: &GeminiLiveConfig) -> Result<(), String> {
+    let path = gemini_live_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "Unable to create the local settings directory.")?;
+    }
+    let content = serde_json::to_string_pretty(config)
+        .map_err(|_| "Unable to encode Gemini Live settings.")?;
+    std::fs::write(path, content + "\n")
+        .map_err(|_| "Unable to save Gemini Live settings.".to_string())
+}
+
+#[tauri::command]
+async fn get_gemini_live_config() -> Result<GeminiLiveConfig, String> {
+    Ok(read_gemini_live_config())
+}
+
+#[tauri::command]
+async fn set_gemini_live_config(processing_acknowledged: bool) -> Result<(), String> {
+    if !processing_acknowledged {
+        return write_gemini_live_config(&GeminiLiveConfig::default());
+    }
+    if !matches!(secure_store_get("GEMINI_API_KEY"), Ok(Some(value)) if !value.is_empty()) {
+        return Err(
+            "Save a Gemini API key in the operating-system credential store before enabling Gemini Live."
+                .into(),
+        );
+    }
+    write_gemini_live_config(&GeminiLiveConfig {
+        processing_acknowledged: true,
+    })
+}
+
+/// Mints a one-use, model-constrained token for a direct renderer-to-Gemini
+/// Live WebSocket. The long-lived key stays in the OS keyring and the short
+/// token is deliberately not logged, persisted, or passed to Python.
+fn gemini_live_token_payload() -> serde_json::Value {
+    serde_json::json!({
+        "uses": 1,
+        "liveConnectConstraints": {
+            "model": format!("models/{GEMINI_LIVE_MODEL}"),
+            "config": {
+                "responseModalities": ["AUDIO"],
+                "sessionResumption": {}
+            }
+        }
+    })
+}
+
+#[tauri::command]
+async fn mint_gemini_live_session_token() -> Result<GeminiLiveSessionToken, String> {
+    if !read_gemini_live_config().processing_acknowledged {
+        return Err(
+            "Enable Gemini Live and confirm that Google processes streamed microphone audio before connecting."
+                .into(),
+        );
+    }
+    let api_key = secure_store_get("GEMINI_API_KEY")?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Save a Gemini API key in the operating-system credential store.".to_string())?;
+    let payload = gemini_live_token_payload();
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| "Unable to create the Gemini Live client.")?
+        .post(GEMINI_LIVE_TOKEN_URL)
+        .header("x-goog-api-key", api_key)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| "Gemini Live token provisioning failed. Check the network and API access.")?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Gemini Live token provisioning was rejected (HTTP {}).",
+            response.status().as_u16()
+        ));
+    }
+    let token = response
+        .json::<GeminiLiveTokenResponse>()
+        .await
+        .map_err(|_| "Gemini Live returned an invalid token response.")?;
+    if token.name.trim().is_empty() {
+        return Err("Gemini Live returned an empty temporary token.".into());
+    }
+    Ok(GeminiLiveSessionToken {
+        access_token: token.name,
+        expires_at: token.expire_time,
+    })
+}
+
+const ANDROID_ADB_CONFIG_FILE: &str = "android-adb.json";
+
+/// Local Android ADB settings. Device serial and executable path stay native:
+/// they are never copied into the cloud backend or approval payload.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+struct AndroidAdbConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adb_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_serial: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    diagnostics_acknowledged: bool,
+}
+
+fn android_adb_config_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(home_dir())
+        .join(".openjarvis")
+        .join(ANDROID_ADB_CONFIG_FILE)
+}
+
+fn is_safe_android_adb_path(path: &str) -> bool {
+    let normalized = path.trim().replace('/', "\\").to_ascii_lowercase();
+    let bytes = normalized.as_bytes();
+    bytes.len() > 26
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && normalized.ends_with("\\platform-tools\\adb.exe")
+        && !normalized.contains("..")
+}
+
+fn is_safe_android_adb_serial(serial: &str) -> bool {
+    !serial.is_empty()
+        && serial.len() <= 128
+        && serial
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':'))
+}
+
+fn read_android_adb_config() -> AndroidAdbConfig {
+    std::fs::read_to_string(android_adb_config_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<AndroidAdbConfig>(&text).ok())
+        .filter(|config| {
+            config
+                .adb_path
+                .as_deref()
+                .is_some_and(is_safe_android_adb_path)
+                && config
+                    .device_serial
+                    .as_deref()
+                    .is_some_and(is_safe_android_adb_serial)
+        })
+        .unwrap_or_default()
+}
+
+fn write_android_adb_config(config: &AndroidAdbConfig) -> Result<(), String> {
+    let path = android_adb_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "Unable to create the local settings directory.")?;
+    }
+    let content = serde_json::to_string_pretty(config)
+        .map_err(|_| "Unable to encode Android ADB settings.")?;
+    std::fs::write(path, content + "\n")
+        .map_err(|_| "Unable to save Android ADB settings.".to_string())
+}
+
+#[tauri::command]
+async fn get_android_adb_config() -> Result<AndroidAdbConfig, String> {
+    Ok(read_android_adb_config())
+}
+
+#[tauri::command]
+async fn set_android_adb_config(
+    adb_path: Option<String>,
+    device_serial: Option<String>,
+    diagnostics_acknowledged: bool,
+) -> Result<(), String> {
+    let adb_path = adb_path.unwrap_or_default().trim().to_string();
+    let device_serial = device_serial.unwrap_or_default().trim().to_string();
+    if adb_path.is_empty() && device_serial.is_empty() {
+        return write_android_adb_config(&AndroidAdbConfig::default());
+    }
+    if !diagnostics_acknowledged {
+        return Err("Confirm the read-only Android ADB diagnostic boundary before enabling it.".into());
+    }
+    if !is_safe_android_adb_path(&adb_path) || !std::path::Path::new(&adb_path).is_file() {
+        return Err("Select the existing adb.exe inside an official Android SDK Platform Tools directory.".into());
+    }
+    if !is_safe_android_adb_serial(&device_serial) {
+        return Err("Select one Android device reported by the local ADB discovery command.".into());
+    }
+    write_android_adb_config(&AndroidAdbConfig {
+        adb_path: Some(adb_path),
+        device_serial: Some(device_serial),
+        diagnostics_acknowledged: true,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct AndroidAdbDevice {
+    serial: String,
+    state: String,
+    model: Option<String>,
+}
+
+#[tauri::command]
+async fn discover_android_adb_devices(adb_path: String) -> Result<Vec<AndroidAdbDevice>, String> {
+    let adb_path = adb_path.trim();
+    if !is_safe_android_adb_path(adb_path) || !std::path::Path::new(adb_path).is_file() {
+        return Err("Select the existing adb.exe inside an official Android SDK Platform Tools directory.".into());
+    }
+    let mut command = tokio::process::Command::new(adb_path);
+    command.args(["devices", "-l"]);
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(8), command.output())
+        .await
+        .map_err(|_| "ADB discovery timed out.")?
+        .map_err(|_| "Android Platform Tools could not run device discovery.")?;
+    if !output.status.success() || output.stdout.len() > 64 * 1024 {
+        return Err("ADB device discovery was rejected or produced unsafe output.".into());
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| "ADB device discovery returned invalid text.")?;
+    let mut devices = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 2 || !is_safe_android_adb_serial(fields[0]) {
+            continue;
+        }
+        let model = fields
+            .iter()
+            .find_map(|field| field.strip_prefix("model:"))
+            .filter(|model| model.len() <= 80 && model.chars().all(|ch| ch.is_ascii_graphic() || ch == '_'))
+            .map(str::to_string);
+        devices.push(AndroidAdbDevice {
+            serial: fields[0].to_string(),
+            state: fields[1].to_string(),
+            model,
+        });
+    }
+    Ok(devices)
+}
+
+const CONTROLLED_FOLDERS_FILE: &str = "controlled-local-folders.json";
+const MAX_CONTROLLED_FOLDERS: usize = 8;
+
+fn controlled_folders_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(home_dir())
+        .join(".openjarvis")
+        .join(CONTROLLED_FOLDERS_FILE)
+}
+
+fn is_safe_controlled_folder(folder: &std::path::Path) -> bool {
+    let Ok(canonical) = folder.canonicalize() else {
+        return false;
+    };
+    if !canonical.is_dir() || canonical.parent().is_none() {
+        return false;
+    }
+    let home = std::path::PathBuf::from(home_dir());
+    if canonical == home || canonical == home.join(".openjarvis") {
+        return false;
+    }
+    let blocked = [
+        ".aws",
+        ".gnupg",
+        ".openjarvis",
+        ".ssh",
+        "appdata",
+        "program files",
+        "program files (x86)",
+        "system32",
+        "windows",
+    ];
+    !canonical.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        blocked.iter().any(|name| value == *name)
+    })
+}
+
+fn read_controlled_folders() -> Vec<String> {
+    let Ok(value) = std::fs::read_to_string(controlled_folders_path()) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value) else {
+        return Vec::new();
+    };
+    let Some(folders) = parsed.get("folders").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut safe = Vec::new();
+    for raw in folders.iter().take(MAX_CONTROLLED_FOLDERS) {
+        let Some(raw) = raw.as_str() else { continue };
+        let path = std::path::PathBuf::from(raw);
+        if path.is_absolute() && is_safe_controlled_folder(&path) {
+            if let Ok(canonical) = path.canonicalize() {
+                let value = canonical.to_string_lossy().to_string();
+                if !safe.contains(&value) {
+                    safe.push(value);
+                }
+            }
+        }
+    }
+    safe
+}
+
+#[tauri::command]
+async fn get_controlled_folders() -> Result<Vec<String>, String> {
+    Ok(read_controlled_folders())
+}
+
+#[tauri::command]
+async fn set_controlled_folders(folders: Vec<String>) -> Result<Vec<String>, String> {
+    if folders.len() > MAX_CONTROLLED_FOLDERS {
+        return Err(format!("At most {} external folders can be approved.", MAX_CONTROLLED_FOLDERS));
+    }
+    let mut safe = Vec::new();
+    for raw in folders {
+        let path = std::path::PathBuf::from(raw);
+        if !path.is_absolute() || !is_safe_controlled_folder(&path) {
+            return Err("Each folder must be an existing, non-system absolute directory.".into());
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| "Unable to resolve an approved folder.")?;
+        let value = canonical.to_string_lossy().to_string();
+        if !safe.contains(&value) {
+            safe.push(value);
+        }
+    }
+    let path = controlled_folders_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "Unable to create the local settings directory.")?;
+    }
+    let content = serde_json::to_string_pretty(&serde_json::json!({
+        "version": 1,
+        "folders": safe,
+    }))
+    .map_err(|_| "Unable to encode the folder settings.")?;
+    std::fs::write(path, content + "\n")
+        .map_err(|_| "Unable to save the approved folders.")?;
+    Ok(read_controlled_folders())
+}
+
+/// Parse config text. Any missing, invalid, or legacy-local configuration
+/// becomes the cloud-only default, which requires explicit provider consent.
+fn parse_inference_config(text: &str) -> InferenceConfig {
+    let cfg = serde_json::from_str::<InferenceConfig>(text).unwrap_or_default();
+    if matches!(cfg.kind, SourceKind::Ollama | SourceKind::Custom) {
+        InferenceConfig::default()
+    } else {
+        cfg
+    }
+}
+
+/// Read the on-disk inference config, or the cloud-only default if absent.
 fn read_inference_config() -> InferenceConfig {
     match std::fs::read_to_string(inference_config_path()) {
         Ok(text) => parse_inference_config(&text),
@@ -2295,6 +2969,28 @@ fn upsert_engine_host(existing: &str, engine: &str, host: &str) -> Result<String
     Ok(doc.to_string())
 }
 
+/// Persist the cloud privacy boundary before starting the local backend.
+fn set_cloud_privacy_config(provider: &str) -> Result<(), String> {
+    validate_cloud_provider(provider)?;
+    let path = std::path::PathBuf::from(home_dir())
+        .join(".openjarvis")
+        .join("config.toml");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create configuration directory: {}", e))?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("Invalid config.toml: {}", e))?;
+    doc["privacy"]["mode"] = toml_edit::value("explicit_external");
+    doc["privacy"]["approved_external_providers"] = toml_edit::value(provider);
+    doc["privacy"]["require_tls"] = toml_edit::value(true);
+    doc["analytics"]["enabled"] = toml_edit::value(false);
+    std::fs::write(&path, doc.to_string())
+        .map_err(|e| format!("Failed to write cloud privacy configuration: {}", e))
+}
+
 /// Write the custom-endpoint host into ~/.openjarvis/config.toml so
 /// `jarvis serve` (which reads that file via load_config) points at it.
 /// The `<ENGINE>_HOST` env var is unreliable — it is shadowed by the engine's
@@ -2309,15 +3005,6 @@ fn set_engine_host_in_config(engine: &str, host: &str) -> Result<(), String> {
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = upsert_engine_host(&existing, engine, host)?;
     std::fs::write(&path, updated).map_err(|e| format!("Failed to write config.toml: {}", e))
-}
-
-/// Normalize a user-entered server URL to a bare base host: trim whitespace,
-/// drop a trailing `/v1` segment (the engine re-appends its own api prefix),
-/// then drop any trailing slash.
-fn normalize_host(raw: &str) -> String {
-    let s = raw.trim().trim_end_matches('/');
-    let s = s.strip_suffix("/v1").unwrap_or(s);
-    s.trim_end_matches('/').to_string()
 }
 
 /// Check speech backend health.
@@ -2737,15 +3424,7 @@ pub fn run() {
         .manage(backend.clone())
         .manage(status.clone())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec!["--hidden"]),
-        ))
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();
@@ -2824,6 +3503,7 @@ pub fn run() {
             start_backend,
             stop_backend,
             check_health,
+            run_secure_self_test,
             fetch_energy,
             fetch_telemetry,
             fetch_traces,
@@ -2834,17 +3514,25 @@ pub fn run() {
             search_memory,
             fetch_agents,
             fetch_models,
-            run_jarvis_command,
             fetch_savings,
             submit_savings,
             transcribe_audio,
             speech_health,
-            pull_ollama_model,
-            delete_ollama_model,
             save_cloud_key,
             get_cloud_key_status,
             get_inference_source,
             set_inference_source,
+            get_transcription_source,
+            set_transcription_source,
+            get_transcription_status,
+            get_gemini_live_config,
+            set_gemini_live_config,
+            mint_gemini_live_session_token,
+            get_android_adb_config,
+            set_android_adb_config,
+            discover_android_adb_devices,
+            get_controlled_folders,
+            set_controlled_folders,
             toggle_overlay,
             hide_overlay,
             get_overlay_conversation,
@@ -2870,12 +3558,51 @@ mod tests {
     use super::{
         boot_plan, default_local_model, format_extension_import_failure,
         format_missing_rust_toolchain, format_port_unavailable, format_uv_sync_failure,
-        format_uv_sync_spawn_error, matching_installed_model, model_names_match, normalize_host,
-        parse_inference_config, parse_ollama_model_names, preferred_installed_model,
-        should_persist_resolved_model, startup_installed_model, upsert_engine_host,
-        uv_sync_stderr_tail, InferenceConfig, SourceKind, DESKTOP_UV_SYNC_COMMAND,
+        format_uv_sync_spawn_error, matching_installed_model, model_names_match,
+        gemini_live_token_payload, parse_inference_config, parse_ollama_model_names,
+        preferred_installed_model, secure_self_test_check, secure_self_test_report,
+        should_persist_resolved_model,
+        startup_installed_model, upsert_engine_host, uv_sync_stderr_tail, InferenceConfig,
+        SourceKind, DESKTOP_UV_SYNC_COMMAND,
     };
     use std::path::Path;
+
+    #[test]
+    fn gemini_live_token_payload_is_one_use_audio_only_and_model_constrained() {
+        let payload = gemini_live_token_payload();
+
+        assert_eq!(payload["uses"], 1);
+        assert_eq!(
+            payload["liveConnectConstraints"]["model"],
+            "models/gemini-3.1-flash-live-preview"
+        );
+        assert_eq!(
+            payload["liveConnectConstraints"]["config"]["responseModalities"],
+            serde_json::json!(["AUDIO"])
+        );
+        assert!(payload["liveConnectConstraints"]["config"]
+            .get("sessionResumption")
+            .is_some());
+    }
+
+    #[test]
+    fn secure_self_test_counts_only_declared_statuses() {
+        let report = secure_self_test_report(vec![
+            secure_self_test_check("cloud", "pass", "Cloud", "Ready"),
+            secure_self_test_check("voice", "not_configured", "Voice", "Missing"),
+            secure_self_test_check(
+                "desktop",
+                "live_check_required",
+                "Desktop",
+                "Manual verification required",
+            ),
+        ]);
+
+        assert_eq!(report.passed, 1);
+        assert_eq!(report.warnings, 1);
+        assert_eq!(report.live_checks_required, 1);
+        assert_eq!(report.checks.len(), 3);
+    }
 
     #[test]
     fn tail_returns_whole_string_when_shorter_than_limit() {
@@ -3091,27 +3818,28 @@ mod tests {
 
     #[test]
     fn parse_defaults_to_ollama_when_file_missing_or_garbage() {
-        assert!(matches!(parse_inference_config("").kind, SourceKind::Ollama));
-        assert!(matches!(parse_inference_config("not json").kind, SourceKind::Ollama));
+        assert!(matches!(parse_inference_config("").kind, SourceKind::Cloud));
+        assert!(matches!(parse_inference_config("not json").kind, SourceKind::Cloud));
     }
 
     #[test]
-    fn parse_reads_custom_endpoint() {
+    fn parse_legacy_local_config_resets_to_cloud_default() {
         let cfg = parse_inference_config(
             r#"{"kind":"custom","model":"qwen2.5-7b","host":"http://localhost:1234","engine":"lmstudio"}"#,
         );
-        assert!(matches!(cfg.kind, SourceKind::Custom));
-        assert_eq!(cfg.model.as_deref(), Some("qwen2.5-7b"));
-        assert_eq!(cfg.host.as_deref(), Some("http://localhost:1234"));
-        assert_eq!(cfg.engine.as_deref(), Some("lmstudio"));
+        assert!(matches!(cfg.kind, SourceKind::Cloud));
+        assert!(cfg.model.is_none());
+        assert!(cfg.provider.is_none());
     }
 
     #[test]
-    fn normalize_host_strips_trailing_slash_and_v1() {
-        assert_eq!(normalize_host("http://localhost:1234/v1"), "http://localhost:1234");
-        assert_eq!(normalize_host("http://localhost:1234/v1/"), "http://localhost:1234");
-        assert_eq!(normalize_host("http://localhost:1234/"), "http://localhost:1234");
-        assert_eq!(normalize_host("http://host:8000"), "http://host:8000");
+    fn parse_cloud_profile_preserves_authorized_provider() {
+        let cfg = parse_inference_config(
+            r#"{"kind":"cloud","provider":"openai","model":"gpt-5-mini"}"#,
+        );
+        assert!(matches!(cfg.kind, SourceKind::Cloud));
+        assert_eq!(cfg.provider.as_deref(), Some("openai"));
+        assert_eq!(cfg.model.as_deref(), Some("gpt-5-mini"));
     }
 
     #[test]
@@ -3143,6 +3871,9 @@ mod tests {
             model: Some("qwen2.5-7b".into()),
             host: Some("http://localhost:1234".into()),
             engine: Some("lmstudio".into()),
+            provider: None,
+            provider_endpoint: None,
+            provider_processing_acknowledged: false,
         };
         let plan = boot_plan(&cfg, 16.0);
         assert!(!plan.launch_ollama);
@@ -3162,6 +3893,9 @@ mod tests {
             model: Some("m".into()),
             host: Some("http://h:1".into()),
             engine: None,
+            provider: None,
+            provider_endpoint: None,
+            provider_processing_acknowledged: false,
         };
         let plan = boot_plan(&cfg, 16.0);
         assert_eq!(plan.engine_host.as_ref().unwrap().0, "lmstudio");
@@ -3176,6 +3910,9 @@ mod tests {
             model: Some("m".into()),
             host: None,
             engine: Some("lmstudio".into()),
+            provider: None,
+            provider_endpoint: None,
+            provider_processing_acknowledged: false,
         };
         let plan = boot_plan(&cfg, 16.0);
         assert!(plan.engine_host.is_none());

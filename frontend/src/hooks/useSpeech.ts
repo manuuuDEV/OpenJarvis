@@ -11,11 +11,16 @@ export function useSpeech() {
   const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
 
-  // Check if speech backend is available on mount
+  // Check native transcription status at mount and after Settings changes.
   useEffect(() => {
-    fetchSpeechHealth()
-      .then((health) => setAvailable(health.available))
-      .catch(() => setAvailable(false));
+    const refresh = () => {
+      fetchSpeechHealth()
+        .then((health) => setAvailable(health.available))
+        .catch(() => setAvailable(false));
+    };
+    refresh();
+    window.addEventListener('openjarvis-transcription-status-changed', refresh);
+    return () => window.removeEventListener('openjarvis-transcription-status-changed', refresh);
   }, []);
 
   const startRecording = useCallback(async (): Promise<void> => {

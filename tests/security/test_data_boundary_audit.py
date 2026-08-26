@@ -209,7 +209,9 @@ def test_memory_plus_cloud_provider_is_fail(tmp_path):
     "model",
     ["deepseek-r1:7b", "google/gemma-3-4b-it", "openai/gpt-oss-20b"],
 )
-def test_local_engine_vendor_model_names_are_not_cloud(tmp_path, model):
+def test_local_engine_vendor_model_names_are_not_cloud(tmp_path, model, monkeypatch):
+    for env_name in API_KEY_ENV_VARS:
+        monkeypatch.delenv(env_name, raising=False)
     config = _low_noise_config()
     config.engine.default = "ollama"
     config.intelligence.default_model = model

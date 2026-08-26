@@ -20,6 +20,10 @@ _MAX_TIMEOUT = 300
 # Default timeout (seconds)
 _DEFAULT_TIMEOUT = 30
 
+# Shell execution is never available by default. A deployment must opt in at
+# process start, after considering prompt-injection risk and OS-level isolation.
+_SHELL_EXEC_OPT_IN_ENV = "OPENJARVIS_ENABLE_SHELL_EXEC"
+
 # Environment variables always passed through on every platform.
 _PORTABLE_ENV_KEYS = (
     "PATH",
@@ -98,6 +102,17 @@ class ShellExecTool(BaseTool):
         )
 
     def execute(self, **params: Any) -> ToolResult:
+        if os.environ.get(_SHELL_EXEC_OPT_IN_ENV) != "1":
+            return ToolResult(
+                tool_name="shell_exec",
+                content=(
+                    "Shell execution is disabled by default. Set "
+                    "OPENJARVIS_ENABLE_SHELL_EXEC=1 only in an isolated, "
+                    "explicitly reviewed deployment."
+                ),
+                success=False,
+            )
+
         command = params.get("command", "")
         if not command:
             return ToolResult(
