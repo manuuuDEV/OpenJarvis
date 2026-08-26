@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { cloudConfigurationRequired, type SetupStatus } from './api';
+import {
+  cloudConfigurationRequired,
+  cloudProfileNeedsConfiguration,
+  type SetupStatus,
+} from './api';
 
 function status(overrides: Partial<SetupStatus> = {}): SetupStatus {
   return {
@@ -13,6 +17,20 @@ function status(overrides: Partial<SetupStatus> = {}): SetupStatus {
     ...overrides,
   };
 }
+
+describe('cloudProfileNeedsConfiguration', () => {
+  it('requires provider, model, and explicit processing acknowledgement before cloud boot', () => {
+    expect(cloudProfileNeedsConfiguration({ kind: 'cloud' })).toBe(true);
+    expect(
+      cloudProfileNeedsConfiguration({
+        kind: 'cloud',
+        provider: 'openai',
+        model: 'gpt-5-mini',
+        providerProcessingAcknowledged: true,
+      }),
+    ).toBe(false);
+  });
+});
 
 describe('cloudConfigurationRequired', () => {
   it('identifies an unconfigured cloud profile so first launch can open Settings', () => {

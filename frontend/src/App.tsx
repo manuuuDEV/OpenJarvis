@@ -12,13 +12,22 @@ import { CommandPalette } from './components/CommandPalette';
 import { SetupScreen } from './components/SetupScreen';
 import { Toaster } from './components/ui/sonner';
 import { useAppStore } from './lib/store';
-import { fetchModels, fetchServerInfo, fetchSavings, submitSavings, isTauri } from './lib/api';
+import {
+  cloudProfileNeedsConfiguration,
+  fetchModels,
+  fetchServerInfo,
+  fetchSavings,
+  getInferenceSource,
+  isTauri,
+  submitSavings,
+} from './lib/api';
 import { OptInModal } from './components/OptInModal';
 import { track, hashId } from './lib/analytics';
 
 export default function App() {
   const navigate = useNavigate();
   const [setupDone, setSetupDone] = useState(!isTauri());
+  const [checkingCloudProfile, setCheckingCloudProfile] = useState(isTauri());
   const handleSetupReady = useCallback(() => {
     setSetupDone(true);
     // Only fire once per install — guard against setup screen re-appearing
@@ -31,6 +40,27 @@ export default function App() {
   const handleCloudConfigurationRequired = useCallback(() => {
     setSetupDone(true);
     navigate('/settings', { replace: true });
+  }, [navigate]);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    void getInferenceSource()
+      .then((source) => {
+        if (!active) return;
+        if (cloudProfileNeedsConfiguration(source)) {
+          setSetupDone(true);
+          navigate('/settings', { replace: true });
+        }
+      })
+      .catch(() => {
+        // SetupScreen still reports native boot failures if the source cannot be read.
+      })
+      .finally(() => {
+        if (active) setCheckingCloudProfile(false);
+      });
+    return () => {
+      active = false;
+    };
   }, [navigate]);
   const prevModelRef = useRef<string>('');
   const setModels = useAppStore((s) => s.setModels);
@@ -177,6 +207,10 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [commandPaletteOpen, setCommandPaletteOpen, toggleSystemPanel]);
 
+
+  if (checkingCloudProfile) {
+    return null;
+  }
 
   if (!setupDone) {
     return (

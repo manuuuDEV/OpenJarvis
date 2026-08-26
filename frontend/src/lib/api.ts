@@ -1322,6 +1322,11 @@ export type InferenceSource = {
   providerProcessingAcknowledged?: boolean;
 };
 
+/** A first-run cloud profile cannot boot the backend until the user explicitly chooses a provider and model. */
+export function cloudProfileNeedsConfiguration(source: InferenceSource): boolean {
+  return !source.provider || !source.model || !source.providerProcessingAcknowledged;
+}
+
 export async function getInferenceSource(): Promise<InferenceSource> {
   if (isTauri()) {
     try {
