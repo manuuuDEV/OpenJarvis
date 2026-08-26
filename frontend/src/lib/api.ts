@@ -1307,9 +1307,44 @@ export async function fetchPendingApprovals(): Promise<PendingApproval[]> {
   return data.actions || [];
 }
 
-export async function approveAction(actionId: string): Promise<void> {
+export interface ExecutionSecurityReport {
+  allowed: boolean;
+  decision: 'allowed' | 'blocked';
+  summary: string;
+  file_name: string;
+  sha256: string;
+  defender_scan: string;
+  reputation: string;
+  source_zone: string;
+  details: string[];
+}
+
+export interface ApprovalOutcome {
+  status: string;
+  id: string;
+  success: boolean;
+  message?: string;
+  security_report?: ExecutionSecurityReport | null;
+}
+
+export interface ExecutionGuardStatus {
+  execution_guard: boolean;
+  platform: 'windows' | 'unsupported' | string;
+  smart_screen: string;
+  defender_health: string;
+  details: string[];
+}
+
+export async function getExecutionGuardStatus(): Promise<ExecutionGuardStatus> {
+  const res = await apiFetch('/v1/security/execution-guard/status');
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function approveAction(actionId: string): Promise<ApprovalOutcome> {
   const res = await apiFetch(`/v1/approvals/${actionId}/approve`, { method: 'POST' });
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
 }
 
 export async function denyAction(actionId: string): Promise<void> {

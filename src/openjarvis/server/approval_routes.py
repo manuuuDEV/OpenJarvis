@@ -5,10 +5,12 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
+from openjarvis.security.execution_guard import preflight_open, windows_security_status
 from openjarvis.security.output_safety import (
     sanitize_model_output,
     sanitize_payload_for_display,
@@ -127,6 +129,32 @@ async def approve_action(action_id: str) -> Dict[str, Any]:
     if action.action_type in local_action_types:
         from openjarvis.tools.controlled_local import execute_approved_local_action
 
+        security_report: dict[str, Any] | None = None
+        if action.action_type in {"local_app_open", "local_document_open"}:
+            raw_path = (
+                action.payload.get("application")
+                if action.action_type == "local_app_open"
+                else action.payload.get("path")
+            )
+            report = preflight_open(Path(str(raw_path or "")), action_type=action.action_type)
+            security_report = report.as_dict()
+            if not report.allowed:
+                # Approval is intentionally consumed: a stale approval must not be
+                # replayed after an unavailable scan, changed file, or new reputation.
+                store.update_status(action_id, STATUS_EXECUTED)
+                logger.warning(
+                    "Execution guard blocked controlled local action %s: %s",
+                    action_id,
+                    report.summary,
+                )
+                return {
+                    "status": "blocked_by_security_guard",
+                    "id": action_id,
+                    "success": False,
+                    "message": sanitize_model_output(report.summary, max_chars=1_000),
+                    "security_report": security_report,
+                }
+
         success, message = execute_approved_local_action(
             action.action_type, action.payload
         )
@@ -141,6 +169,7 @@ async def approve_action(action_id: str) -> Dict[str, Any]:
             "id": action_id,
             "success": success,
             "message": sanitize_model_output(message, max_chars=1_000),
+            "security_report": security_report,
         }
 
     store.update_status(action_id, STATUS_APPROVED)
@@ -305,6 +334,13 @@ async def complete_android_adb_diagnostic(
         completion.success,
     )
     return {"status": "executed", "id": action_id, "success": bool(completion.success)}
+
+
+@router.get("/v1/security/execution-guard/status")
+async def get_execution_guard_status() -> Dict[str, Any]:
+    """Expose a read-only local Windows Security/guard status snapshot."""
+
+    return windows_security_status()
 
 
 @router.post("/v1/approvals/{action_id}/deny")

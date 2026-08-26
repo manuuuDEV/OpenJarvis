@@ -1438,6 +1438,9 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     // Enable only the bounded, approval-gated local actions. This is distinct
     // from OPENJARVIS_ENABLE_DANGEROUS_TOOLS, which remains unset.
     cmd.env("OPENJARVIS_ENABLE_CONTROLLED_LOCAL_ACTIONS", "1");
+    // Every controlled app/document launch is checked locally before it can
+    // execute. An unavailable or inconclusive Defender check denies the action.
+    cmd.env("OPENJARVIS_ENABLE_EXECUTION_GUARD", "1");
     // The model can only propose structured UI plans. A separate native broker
     // validates the user-approved plan before any Windows UI Automation action.
     cmd.env("OPENJARVIS_ENABLE_CONTROLLED_DESKTOP_OPERATOR", "1");

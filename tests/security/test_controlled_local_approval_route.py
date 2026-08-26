@@ -6,6 +6,8 @@ import asyncio
 from pathlib import Path
 
 import pytest
+
+from openjarvis.security.execution_guard import ExecutionSecurityReport
 from fastapi import HTTPException
 
 from openjarvis.server import approval_routes
@@ -51,6 +53,63 @@ def test_ui_approval_consumes_controlled_write_once(
     finally:
         approval_routes._store = previous_store
         store.close()
+
+
+def test_execution_guard_blocks_approved_app_before_local_launch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    store = ApprovalStore(str(tmp_path / "approvals.db"))
+    previous_store = approval_routes._store
+    approval_routes._store = store
+    try:
+        action = store.queue_action(
+            action_type="local_app_open",
+            description="Open untrusted.exe",
+            payload={"application": r"C:\\Tools\\untrusted.exe"},
+            permission_key="local_app_open:always_ask",
+            tier=TIER_HIGH,
+            ttl_hours=1,
+        )
+        blocked = ExecutionSecurityReport(
+            allowed=False,
+            decision="blocked",
+            summary="Blocked before opening: test guard result.",
+            file_name="untrusted.exe",
+            sha256="abc",
+            defender_scan="failed",
+            reputation="not-run",
+            source_zone="internet",
+            details=("test guard result",),
+        )
+        monkeypatch.setattr(approval_routes, "preflight_open", lambda *_args, **_kwargs: blocked)
+
+        response = asyncio.run(approval_routes.approve_action(action.id))
+
+        assert response["status"] == "blocked_by_security_guard"
+        assert response["success"] is False
+        assert response["security_report"]["decision"] == "blocked"
+        assert store.get_action(action.id).status == STATUS_EXECUTED
+    finally:
+        approval_routes._store = previous_store
+        store.close()
+
+
+def test_execution_guard_status_is_read_only(monkeypatch) -> None:
+    snapshot = {
+        "execution_guard": True,
+        "platform": "windows",
+        "smart_screen": "os-managed; status is not independently queryable",
+        "defender_health": "good",
+        "details": ["Read-only Windows Security Center antivirus health."],
+    }
+    monkeypatch.setattr(approval_routes, "windows_security_status", lambda: snapshot)
+
+    response = asyncio.run(approval_routes.get_execution_guard_status())
+
+    assert response == snapshot
+    assert "execution_guard" in response
+    assert "defender_health" in response
+    assert "smart_screen" in response
 
 
 def test_approval_serialization_redacts_pending_write_content(tmp_path: Path) -> None:

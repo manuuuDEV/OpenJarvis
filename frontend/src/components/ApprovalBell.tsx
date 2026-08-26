@@ -25,6 +25,11 @@ export function ApprovalBell() {
   const [open, setOpen] = useState(false);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [processing, setProcessing] = useState<Record<string, boolean>>({});
+  const [executionNotice, setExecutionNotice] = useState<{
+    success: boolean;
+    message: string;
+    report?: { defender_scan: string; reputation: string; source_zone: string; sha256: string } | null;
+  } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(async () => {
@@ -55,8 +60,14 @@ export function ApprovalBell() {
   const handleApprove = async (id: string) => {
     setProcessing(p => ({ ...p, [id]: true }));
     try {
-      await approveAction(id);
+      const outcome = await approveAction(id);
       setApprovals(prev => prev.filter(a => a.id !== id));
+      setExecutionNotice({
+        success: outcome.success,
+        message: outcome.message || (outcome.success ? 'Azione completata.' : 'Azione bloccata.'),
+        report: outcome.security_report,
+      });
+      setOpen(true);
     } finally {
       setProcessing(p => ({ ...p, [id]: false }));
     }
@@ -135,6 +146,32 @@ export function ApprovalBell() {
               </span>
             )}
           </div>
+
+          {executionNotice && (
+            <div
+              className="mx-3 mt-3 rounded-lg p-3 text-xs"
+              style={{
+                background: executionNotice.success
+                  ? 'color-mix(in srgb, var(--color-success) 10%, transparent)'
+                  : 'color-mix(in srgb, var(--color-error) 10%, transparent)',
+                border: `1px solid ${executionNotice.success
+                  ? 'color-mix(in srgb, var(--color-success) 28%, transparent)'
+                  : 'color-mix(in srgb, var(--color-error) 28%, transparent)'}`,
+                color: 'var(--color-text)',
+              }}
+            >
+              <div className="font-semibold mb-1">
+                {executionNotice.success ? 'Controllo di sicurezza completato' : 'Azione bloccata dal controllo di sicurezza'}
+              </div>
+              <div>{executionNotice.message}</div>
+              {executionNotice.report && (
+                <div className="mt-2 text-[10px]" style={{ color: 'var(--color-text-secondary)' }}>
+                  Defender: {executionNotice.report.defender_scan} · Reputazione: {executionNotice.report.reputation} · Origine: {executionNotice.report.source_zone}
+                  {executionNotice.report.sha256 && <><br />SHA-256: {executionNotice.report.sha256}</>}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Body */}
           <div className="overflow-y-auto flex-1">

@@ -34,6 +34,7 @@ import {
   getControlledFolders,
   setControlledFolders,
   runSecureSelfTest,
+  getExecutionGuardStatus,
   getCloudKeyStatus,
   saveCloudKey,
   fetchToolCredentialStatus,
@@ -43,6 +44,7 @@ import {
   type CloudProvider,
   type AndroidAdbDevice,
   type SecureSelfTestReport,
+  type ExecutionGuardStatus,
 } from '../lib/api';
 
 const CLOUD_KEY_STATUS_CHANGED = 'openjarvis-cloud-key-status-changed';
@@ -267,6 +269,19 @@ export function SettingsPage() {
   const [secureSelfTestReport, setSecureSelfTestReport] = useState<SecureSelfTestReport | null>(null);
   const [secureSelfTestRunning, setSecureSelfTestRunning] = useState(false);
   const [secureSelfTestError, setSecureSelfTestError] = useState('');
+  const [executionGuardStatus, setExecutionGuardStatus] = useState<ExecutionGuardStatus | null>(null);
+  const [executionGuardError, setExecutionGuardError] = useState('');
+
+  const refreshExecutionGuardStatus = useCallback(async () => {
+    if (!desktopBuild) return;
+    try {
+      setExecutionGuardError('');
+      setExecutionGuardStatus(await getExecutionGuardStatus());
+    } catch (error: any) {
+      setExecutionGuardStatus(null);
+      setExecutionGuardError(error?.message ?? 'Impossibile leggere lo stato di Windows Security.');
+    }
+  }, [desktopBuild]);
 
   useEffect(() => {
     getInferenceSource().then((s) => {
@@ -291,7 +306,8 @@ export function SettingsPage() {
       setAndroidAdbAcknowledged(config.diagnostics_acknowledged);
     }).catch(() => {});
     getControlledFolders().then(setControlledFoldersState).catch(() => {});
-  }, []);
+    void refreshExecutionGuardStatus();
+  }, [refreshExecutionGuardStatus]);
 
   const saveSource = useCallback(async () => {
     try {
@@ -566,6 +582,52 @@ export function SettingsPage() {
               )}
             </div>
           </Section>
+
+          {desktopBuild && (
+            <Section title="Protezione apertura file e app">
+              <div className="flex flex-col gap-3">
+                <p className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                  Monitoraggio locale in sola lettura. Le azioni avviate da Jarvis richiedono un controllo Defender prima dell’apertura; OpenJarvis non modifica Defender, SmartScreen, esclusioni o impostazioni di sicurezza Windows.
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
+                  <div className="rounded-lg p-3" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+                    <div style={{ color: 'var(--color-text-secondary)' }}>Guardiano Jarvis</div>
+                    <div className="font-semibold mt-1" style={{ color: executionGuardStatus?.execution_guard ? 'var(--color-success)' : 'var(--color-error)' }}>
+                      {executionGuardStatus ? (executionGuardStatus.execution_guard ? 'Obbligatorio per aperture Jarvis' : 'Non attivo') : 'Stato non letto'}
+                    </div>
+                  </div>
+                  <div className="rounded-lg p-3" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+                    <div style={{ color: 'var(--color-text-secondary)' }}>Windows Security / Defender</div>
+                    <div className="font-semibold mt-1" style={{ color: executionGuardStatus?.defender_health === 'good' ? 'var(--color-success)' : 'var(--color-warning)' }}>
+                      {executionGuardStatus?.defender_health ?? 'Non disponibile'}
+                    </div>
+                  </div>
+                  <div className="rounded-lg p-3" style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}>
+                    <div style={{ color: 'var(--color-text-secondary)' }}>SmartScreen</div>
+                    <div className="font-semibold mt-1" style={{ color: 'var(--color-text)' }}>
+                      {executionGuardStatus?.smart_screen ?? 'Stato non disponibile'}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <button
+                    onClick={() => void refreshExecutionGuardStatus()}
+                    className="px-3 py-2 rounded text-xs font-medium cursor-pointer"
+                    style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }}
+                  >
+                    Aggiorna stato protezione
+                  </button>
+                  <span className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+                    Per una protezione che resta attiva quando Jarvis è chiuso, verifica sempre Windows Security direttamente in Windows.
+                  </span>
+                </div>
+                {executionGuardStatus?.details.map((detail) => (
+                  <p key={detail} className="text-[11px]" style={{ color: 'var(--color-text-secondary)' }}>{detail}</p>
+                ))}
+                {executionGuardError && <p className="text-xs" style={{ color: 'var(--color-error)' }}>{executionGuardError}</p>}
+              </div>
+            </Section>
+          )}
 
           {/* Appearance */}
           <Section title="Appearance">
