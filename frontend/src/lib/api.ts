@@ -1327,6 +1327,16 @@ export function cloudProfileNeedsConfiguration(source: InferenceSource): boolean
   return !source.provider || !source.model || !source.providerProcessingAcknowledged;
 }
 
+/** The cloud-first redirect is an onboarding decision, never a route guard. */
+export function initialCloudRoute(
+  profileWasAlreadyChecked: boolean,
+  source: InferenceSource,
+): 'settings' | 'continue' {
+  return !profileWasAlreadyChecked && cloudProfileNeedsConfiguration(source)
+    ? 'settings'
+    : 'continue';
+}
+
 export async function getInferenceSource(): Promise<InferenceSource> {
   if (isTauri()) {
     try {

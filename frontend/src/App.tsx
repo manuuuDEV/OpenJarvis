@@ -13,7 +13,7 @@ import { SetupScreen } from './components/SetupScreen';
 import { Toaster } from './components/ui/sonner';
 import { useAppStore } from './lib/store';
 import {
-  cloudProfileNeedsConfiguration,
+  initialCloudRoute,
   fetchModels,
   fetchServerInfo,
   fetchSavings,
@@ -41,13 +41,18 @@ export default function App() {
     setSetupDone(true);
     navigate('/settings', { replace: true });
   }, [navigate]);
+  // In declarative routing, the navigate callback can change after every route
+  // transition. Guard this bootstrap decision explicitly: a missing cloud
+  // profile must open Settings once, not prevent access to every other page.
+  const cloudProfileCheckedRef = useRef(false);
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || cloudProfileCheckedRef.current) return;
+    cloudProfileCheckedRef.current = true;
     let active = true;
     void getInferenceSource()
       .then((source) => {
         if (!active) return;
-        if (cloudProfileNeedsConfiguration(source)) {
+        if (initialCloudRoute(false, source) === 'settings') {
           setSetupDone(true);
           navigate('/settings', { replace: true });
         }

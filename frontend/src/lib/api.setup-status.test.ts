@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   cloudConfigurationRequired,
   cloudProfileNeedsConfiguration,
+  initialCloudRoute,
   type SetupStatus,
 } from './api';
 
@@ -29,6 +30,14 @@ describe('cloudProfileNeedsConfiguration', () => {
         providerProcessingAcknowledged: true,
       }),
     ).toBe(false);
+  });
+});
+
+describe('initialCloudRoute', () => {
+  it('redirects an incomplete profile only during the single onboarding check', () => {
+    const incomplete = { kind: 'cloud' } as const;
+    expect(initialCloudRoute(false, incomplete)).toBe('settings');
+    expect(initialCloudRoute(true, incomplete)).toBe('continue');
   });
 });
 
