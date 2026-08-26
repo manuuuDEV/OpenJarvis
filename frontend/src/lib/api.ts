@@ -120,13 +120,28 @@ const getSettingsApiUrl = (): string => {
   return '';
 };
 
-export const getBase = (): string => {
-  const settingsUrl = getSettingsApiUrl();
+export const selectApiBase = (
+  desktop: boolean,
+  nativeApiBase: string | null,
+  settingsUrl: string,
+  buildApiUrl?: string,
+): string => {
+  // In the packaged app the Rust process starts and owns the local API. A
+  // value persisted by an upstream web build must never turn the renderer
+  // into a client of an arbitrary remote host.
+  if (desktop) return nativeApiBase || DESKTOP_API_FALLBACK;
   if (settingsUrl) return settingsUrl;
-  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
-  if (isTauri()) return _tauriApiBase || DESKTOP_API_FALLBACK;
+  if (buildApiUrl) return buildApiUrl;
   return '';
 };
+
+export const getBase = (): string =>
+  selectApiBase(
+    isTauri(),
+    _tauriApiBase,
+    getSettingsApiUrl(),
+    import.meta.env.VITE_API_URL as string | undefined,
+  );
 
 // Resolve the local server API key (OPENJARVIS_API_KEY). When `jarvis serve`
 // is started with a key, AuthMiddleware 401s every /v1 and /api request that
@@ -134,6 +149,10 @@ export const getBase = (): string => {
 // same settings blob as the API URL, with an optional build-time env override.
 // Returns '' when unset, so a keyless local server keeps working unchanged.
 export const getApiKey = (): string => {
+  // The packaged desktop owns its local backend and does not support a
+  // renderer-configured remote server. Keeping this empty also prevents a
+  // legacy API key in localStorage from being sent to an arbitrary endpoint.
+  if (isTauri()) return '';
   try {
     const raw = localStorage.getItem('openjarvis-settings');
     if (raw) {

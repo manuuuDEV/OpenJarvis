@@ -218,6 +218,7 @@ const themeOptions: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
 ];
 
 export function SettingsPage() {
+  const desktopBuild = isTauri();
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const conversations = useAppStore((s) => s.conversations);
@@ -621,35 +622,48 @@ export function SettingsPage() {
                 </span>
               </div>
             </SettingRow>
-            <SettingRow label="API URL" description="Set if backend runs on a different port or host">
-              <input
-                type="text"
-                value={settings.apiUrl}
-                onChange={(e) => { updateSettings({ apiUrl: e.target.value }); showSaved(); }}
-                placeholder="http://localhost:8000"
-                className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                style={{
-                  background: 'var(--color-bg-secondary)',
-                  color: 'var(--color-text)',
-                  border: '1px solid var(--color-border)',
-                }}
-              />
-            </SettingRow>
-            <SettingRow label="API key" description="Required only if the server was started with an API key">
-              <input
-                type="password"
-                value={settings.apiKey}
-                onChange={(e) => { updateSettings({ apiKey: e.target.value }); showSaved(); }}
-                placeholder="OPENJARVIS_API_KEY"
-                autoComplete="off"
-                className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                style={{
-                  background: 'var(--color-bg-secondary)',
-                  color: 'var(--color-text)',
-                  border: '1px solid var(--color-border)',
-                }}
-              />
-            </SettingRow>
+            {desktopBuild ? (
+              <SettingRow
+                label="Backend desktop"
+                description="Gestito localmente dal processo nativo. Questa build non usa URL o API key del backend salvati nel browser e non può essere reindirizzata a un host remoto."
+              >
+                <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                  Endpoint locale gestito dall’app
+                </span>
+              </SettingRow>
+            ) : (
+              <>
+                <SettingRow label="API URL" description="Set if backend runs on a different port or host">
+                  <input
+                    type="text"
+                    value={settings.apiUrl}
+                    onChange={(e) => { updateSettings({ apiUrl: e.target.value }); showSaved(); }}
+                    placeholder="http://localhost:8000"
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{
+                      background: 'var(--color-bg-secondary)',
+                      color: 'var(--color-text)',
+                      border: '1px solid var(--color-border)',
+                    }}
+                  />
+                </SettingRow>
+                <SettingRow label="API key" description="Required only if the server was started with an API key">
+                  <input
+                    type="password"
+                    value={settings.apiKey}
+                    onChange={(e) => { updateSettings({ apiKey: e.target.value }); showSaved(); }}
+                    placeholder="OPENJARVIS_API_KEY"
+                    autoComplete="off"
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{
+                      background: 'var(--color-bg-secondary)',
+                      color: 'var(--color-text)',
+                      border: '1px solid var(--color-border)',
+                    }}
+                  />
+                </SettingRow>
+              </>
+            )}
           </Section>
 
           {/* Cloud-only inference */}

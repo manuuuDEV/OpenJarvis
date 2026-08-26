@@ -21,11 +21,18 @@ def _csp_sources(directive: str) -> set[str]:
     return directives[directive]
 
 
-def test_desktop_csp_allows_remote_api_servers() -> None:
-    """The user-configured API URL may point beyond localhost (#649)."""
+def test_desktop_csp_confines_renderer_to_the_native_local_backend() -> None:
+    """The packaged cloud desktop must not expose a renderer-configured remote API."""
     connect_sources = _csp_sources("connect-src")
 
-    assert {"http:", "https:", "ws:", "wss:"} <= connect_sources
+    assert {
+        "'self'",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+        "ws://127.0.0.1:8000",
+        "ws://localhost:8000",
+    } <= connect_sources
+    assert not {"http:", "https:", "ws:", "wss:"} & connect_sources
 
 
 def test_macos_webview_allows_user_configured_http_servers() -> None:
@@ -42,9 +49,9 @@ def test_local_build_does_not_require_updater_signing_key() -> None:
     assert config["bundle"]["createUpdaterArtifacts"] is False
 
 
-def test_release_workflow_explicitly_enables_updater_artifacts() -> None:
-    """Signed releases must still publish updater signatures and latest.json."""
+def test_release_workflow_keeps_auto_update_disabled() -> None:
+    """The security profile does not ship update metadata or updater signatures."""
     workflow = DESKTOP_WORKFLOW.read_text(encoding="utf-8")
 
-    assert '"createUpdaterArtifacts":true' in workflow
-    assert "uploadUpdaterJson: true" in workflow
+    assert '"createUpdaterArtifacts":false' in workflow
+    assert "uploadUpdaterJson: false" in workflow

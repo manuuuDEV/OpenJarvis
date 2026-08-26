@@ -37,11 +37,9 @@ def test_build_frozen_prefix(memory_dir: Path):
     assert "Alice" in prompt
 
 
-def test_config_prefix_prepended(memory_dir: Path):
-    """Regression for #401: a configured system_prompt.prefix leads the
-    assembled prompt, ahead of the agent template, and is exposed as a
-    'prefix' section."""
-    from openjarvis.prompt.builder import SystemPromptBuilder
+def test_config_prefix_follows_mandatory_desktop_policy(memory_dir: Path):
+    """A configured prefix remains frozen, after the non-bypassable desktop policy."""
+    from openjarvis.prompt.builder import SECURE_DESKTOP_POLICY, SystemPromptBuilder
 
     builder = SystemPromptBuilder(
         agent_template="You are Jarvis.",
@@ -53,12 +51,14 @@ def test_config_prefix_prepended(memory_dir: Path):
         system_prompt_config=SystemPromptConfig(prefix="ALWAYS ANSWER AS JARVIS."),
     )
     prompt = builder.build()
-    assert prompt.startswith("ALWAYS ANSWER AS JARVIS.")
+    assert prompt.startswith(SECURE_DESKTOP_POLICY)
+    assert "ALWAYS ANSWER AS JARVIS." in prompt
     assert "You are Jarvis." in prompt
-    # Prefix is visible in the inspection API too (#457), as a frozen section.
+    # The configured prefix remains inspectable and frozen, but cannot precede
+    # the mandatory security policy.
     section_names = [s.name for s in builder.sections()]
-    assert section_names[0] == "prefix"
-    assert builder.sections()[0].cache_segment == "frozen_prefix"
+    assert section_names[:2] == ["secure_desktop_policy", "prefix"]
+    assert builder.sections()[1].cache_segment == "frozen_prefix"
 
 
 def test_empty_prefix_leaves_prompt_unchanged(memory_dir: Path):
@@ -80,8 +80,9 @@ def test_empty_prefix_leaves_prompt_unchanged(memory_dir: Path):
     assert _make("").build() == _make("").build()
     # No 'prefix' section is emitted when prefix is empty.
     assert "prefix" not in [s.name for s in _make("").sections()]
-    # And the first section is the agent template, as before.
-    assert _make("").sections()[0].name == "agent_template"
+    # The first section is always the non-bypassable desktop policy.
+    assert _make("").sections()[0].name == "secure_desktop_policy"
+    assert _make("").sections()[1].name == "agent_template"
 
 
 def test_frozen_prefix_stability(memory_dir: Path):
@@ -174,6 +175,7 @@ def test_sections_expose_prompt_metadata(memory_dir: Path):
     sections = builder.sections()
 
     assert [section.name for section in sections] == [
+        "secure_desktop_policy",
         "agent_template",
         "soul",
         "memory",
@@ -181,8 +183,8 @@ def test_sections_expose_prompt_metadata(memory_dir: Path):
         "session_context",
         "previous_state",
     ]
-    assert sections[1].source == str(memory_dir / "SOUL.md")
-    assert sections[1].cache_segment == "frozen_prefix"
+    assert sections[2].source == str(memory_dir / "SOUL.md")
+    assert sections[2].cache_segment == "frozen_prefix"
     assert sections[-1].cache_segment == "dynamic_suffix"
     assert builder.build() == "\n\n".join(section.content for section in sections)
 
