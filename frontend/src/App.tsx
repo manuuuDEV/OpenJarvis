@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Routes, Route } from 'react-router';
+import { Routes, Route, useNavigate } from 'react-router';
 import { Layout } from './components/Layout';
 import { ChatPage } from './pages/ChatPage';
 import { DashboardPage } from './pages/DashboardPage';
@@ -17,6 +17,7 @@ import { OptInModal } from './components/OptInModal';
 import { track, hashId } from './lib/analytics';
 
 export default function App() {
+  const navigate = useNavigate();
   const [setupDone, setSetupDone] = useState(!isTauri());
   const handleSetupReady = useCallback(() => {
     setSetupDone(true);
@@ -27,6 +28,10 @@ export default function App() {
       track('setup_completed', { preset: 'default' });
     }
   }, []);
+  const handleCloudConfigurationRequired = useCallback(() => {
+    setSetupDone(true);
+    navigate('/settings', { replace: true });
+  }, [navigate]);
   const prevModelRef = useRef<string>('');
   const setModels = useAppStore((s) => s.setModels);
   const setModelsLoading = useAppStore((s) => s.setModelsLoading);
@@ -174,7 +179,12 @@ export default function App() {
 
 
   if (!setupDone) {
-    return <SetupScreen onReady={handleSetupReady} />;
+    return (
+      <SetupScreen
+        onReady={handleSetupReady}
+        onConfigurationRequired={handleCloudConfigurationRequired}
+      />
+    );
   }
 
   return (

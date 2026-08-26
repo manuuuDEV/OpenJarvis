@@ -189,7 +189,11 @@ export interface SetupStatus {
   server_ready: boolean;
   model_ready: boolean;
   error: string | null;
-  source?: 'ollama' | 'custom'; // drives source-aware setup labels
+  source?: 'ollama' | 'custom' | 'cloud'; // drives source-aware setup labels
+}
+
+export function cloudConfigurationRequired(status: SetupStatus | null): boolean {
+  return status?.source === 'cloud' && status.phase === 'configuration_required';
 }
 
 export async function getSetupStatus(): Promise<SetupStatus | null> {

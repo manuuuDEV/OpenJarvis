@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Loader2, CheckCircle2, XCircle, Cpu, Server, Database } from 'lucide-react';
 import {
+  cloudConfigurationRequired,
   getSetupStatus,
   fetchModels,
   fetchRecommendedModel,
@@ -75,12 +76,23 @@ function StepRow({
   );
 }
 
-export function SetupScreen({ onReady }: { onReady: () => void }) {
+export function SetupScreen({
+  onReady,
+  onConfigurationRequired,
+}: {
+  onReady: () => void;
+  onConfigurationRequired: () => void;
+}) {
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const handedOffRef = useRef(false);
   const poll = useCallback(async () => {
     const s = await getSetupStatus();
     if (s) setStatus(s);
+    if (cloudConfigurationRequired(s) && !handedOffRef.current) {
+      handedOffRef.current = true;
+      onConfigurationRequired();
+      return;
+    }
     if (s?.phase === 'ready' && !handedOffRef.current) {
       handedOffRef.current = true;
       // Pre-select a model BEFORE handing off so the chat is usable on
@@ -108,7 +120,7 @@ export function SetupScreen({ onReady }: { onReady: () => void }) {
       }
       setTimeout(() => onReady(), 600);
     }
-  }, [onReady]);
+  }, [onConfigurationRequired, onReady]);
 
   useEffect(() => {
     poll();

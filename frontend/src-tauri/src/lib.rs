@@ -1096,6 +1096,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         let model = cfg.model.clone().unwrap_or_default();
         if provider.is_empty() || model.is_empty() {
             let mut s = status.lock().await;
+            s.phase = "configuration_required".into();
             s.error = Some(
                 "Choose one authorized cloud provider and model in Settings before starting OpenJarvis."
                     .into(),
@@ -1104,16 +1105,19 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         }
         if let Err(error) = validate_cloud_provider(&provider) {
             let mut s = status.lock().await;
+            s.phase = "configuration_required".into();
             s.error = Some(error);
             return;
         }
         let Some(key_name) = cloud_api_key_name(&provider) else {
             let mut s = status.lock().await;
+            s.phase = "configuration_required".into();
             s.error = Some("The selected cloud provider has no supported credential mapping.".into());
             return;
         };
         if !matches!(secure_store_get(key_name), Ok(Some(value)) if !value.is_empty()) {
             let mut s = status.lock().await;
+            s.phase = "configuration_required".into();
             s.error = Some(format!(
                 "Add the API key for the authorized provider ({}) in Settings before starting OpenJarvis.",
                 provider
