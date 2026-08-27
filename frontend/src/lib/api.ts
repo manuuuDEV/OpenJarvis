@@ -6,6 +6,8 @@ import { serializeToolCallArguments } from './tool-call';
 // Supabase config
 // ---------------------------------------------------------------------------
 
+declare const __OPENJARVIS_DESKTOP_BUILD__: boolean;
+
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown;
@@ -22,8 +24,23 @@ declare global {
 export const detectTauriRuntime = (runtime: Window | undefined): boolean =>
   Boolean(runtime?.__TAURI_INTERNALS__ || runtime?.__TAURI__);
 
+/**
+ * The Windows package has a compile-time desktop profile. This is deliberately
+ * primary: WebView2 can omit runtime globals while the packaged app must never
+ * fall back to web-only controls such as API URL/API key.
+ */
+export const resolveDesktopRuntime = (
+  bundledDesktopProfile: boolean,
+  runtime: Window | undefined,
+): boolean => bundledDesktopProfile || detectTauriRuntime(runtime);
+
+export const BUNDLED_DESKTOP_PROFILE = __OPENJARVIS_DESKTOP_BUILD__;
+
 export const isTauri = () =>
-  typeof window !== 'undefined' && detectTauriRuntime(window);
+  resolveDesktopRuntime(
+    BUNDLED_DESKTOP_PROFILE,
+    typeof window === 'undefined' ? undefined : window,
+  );
 
 export type CloudKeyStatus = Record<string, boolean>;
 

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { detectTauriRuntime, selectApiBase } from './api';
+import {
+  BUNDLED_DESKTOP_PROFILE,
+  detectTauriRuntime,
+  resolveDesktopRuntime,
+  selectApiBase,
+} from './api';
 
 describe('detectTauriRuntime', () => {
   it('recognizes the official Tauri global when an internal bridge is not exposed', () => {
@@ -10,6 +15,21 @@ describe('detectTauriRuntime', () => {
     expect(detectTauriRuntime({ __TAURI_INTERNALS__: {} } as Window)).toBe(true);
     expect(detectTauriRuntime(undefined)).toBe(false);
     expect(detectTauriRuntime({} as Window)).toBe(false);
+  });
+});
+
+describe('compiled desktop profile', () => {
+  it('matches the expected build profile', () => {
+    expect(BUNDLED_DESKTOP_PROFILE).toBe(
+      import.meta.env.VITE_EXPECT_DESKTOP_PROFILE === 'true',
+    );
+  });
+});
+
+describe('resolveDesktopRuntime', () => {
+  it('uses the desktop profile compiled into the Tauri bundle without runtime globals', () => {
+    expect(resolveDesktopRuntime(true, undefined)).toBe(true);
+    expect(resolveDesktopRuntime(false, undefined)).toBe(false);
   });
 });
 

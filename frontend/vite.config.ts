@@ -16,6 +16,12 @@ import { VitePWA } from 'vite-plugin-pwa';
 const isTauriBuild = Boolean(process.env.TAURI_ENV_PLATFORM);
 
 export default defineConfig({
+  // This value is compiled into the renderer. It is intentionally not inferred
+  // at runtime: some Windows WebView2 configurations do not expose a Tauri
+  // marker before the application UI renders.
+  define: {
+    __OPENJARVIS_DESKTOP_BUILD__: JSON.stringify(isTauriBuild),
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

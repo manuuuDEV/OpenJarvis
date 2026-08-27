@@ -57,6 +57,7 @@ def test_desktop_build_does_not_generate_a_pwa_service_worker() -> None:
     vite_config = VITE_CONFIG.read_text(encoding="utf-8")
 
     assert "TAURI_ENV_PLATFORM" in vite_config
+    assert "__OPENJARVIS_DESKTOP_BUILD__" in vite_config
     assert "...(!isTauriBuild" in vite_config
     assert "VitePWA" in vite_config
 
