@@ -11,6 +11,7 @@ TAURI_CONFIG = ROOT / "frontend" / "src-tauri" / "tauri.conf.json"
 MACOS_INFO_PLIST = ROOT / "frontend" / "src-tauri" / "Info.plist"
 DESKTOP_WORKFLOW = ROOT / ".github" / "workflows" / "desktop.yml"
 VITE_CONFIG = ROOT / "frontend" / "vite.config.ts"
+APP_COMPONENT = ROOT / "frontend" / "src" / "App.tsx"
 
 
 def _csp_sources(directive: str) -> set[str]:
@@ -60,6 +61,15 @@ def test_desktop_build_does_not_generate_a_pwa_service_worker() -> None:
     assert "__OPENJARVIS_DESKTOP_BUILD__" in vite_config
     assert "...(!isTauriBuild" in vite_config
     assert "VitePWA" in vite_config
+
+
+def test_cloud_onboarding_never_forces_a_settings_route() -> None:
+    """An incomplete cloud profile must not trap desktop navigation on Settings."""
+    app = APP_COMPONENT.read_text(encoding="utf-8")
+
+    assert "navigate('/settings'" not in app
+    assert "navigate(\"/settings\"" not in app
+    assert "onConfigurationRequired={handleCloudConfigurationRequired}" in app
 
 
 def test_local_build_does_not_require_updater_signing_key() -> None:

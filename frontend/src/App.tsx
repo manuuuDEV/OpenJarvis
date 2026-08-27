@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Routes, Route, useNavigate } from 'react-router';
+import { Routes, Route } from 'react-router';
 import { Layout } from './components/Layout';
 import { ChatPage } from './pages/ChatPage';
 import { DashboardPage } from './pages/DashboardPage';
@@ -13,11 +13,9 @@ import { SetupScreen } from './components/SetupScreen';
 import { Toaster } from './components/ui/sonner';
 import { useAppStore } from './lib/store';
 import {
-  initialCloudRoute,
   fetchModels,
   fetchServerInfo,
   fetchSavings,
-  getInferenceSource,
   isTauri,
   submitSavings,
 } from './lib/api';
@@ -25,9 +23,7 @@ import { OptInModal } from './components/OptInModal';
 import { track, hashId } from './lib/analytics';
 
 export default function App() {
-  const navigate = useNavigate();
   const [setupDone, setSetupDone] = useState(!isTauri());
-  const [checkingCloudProfile, setCheckingCloudProfile] = useState(isTauri());
   const handleSetupReady = useCallback(() => {
     setSetupDone(true);
     // Only fire once per install — guard against setup screen re-appearing
@@ -37,36 +33,13 @@ export default function App() {
       track('setup_completed', { preset: 'default' });
     }
   }, []);
+  // A missing cloud profile is an onboarding state, never a route guard.
+  // SetupScreen will hand off to the application, but navigation to Settings
+  // is always initiated by an explicit click. This prevents a native status
+  // refresh or an App remount from trapping the user on the Settings route.
   const handleCloudConfigurationRequired = useCallback(() => {
     setSetupDone(true);
-    navigate('/settings', { replace: true });
-  }, [navigate]);
-  // In declarative routing, the navigate callback can change after every route
-  // transition. Guard this bootstrap decision explicitly: a missing cloud
-  // profile must open Settings once, not prevent access to every other page.
-  const cloudProfileCheckedRef = useRef(false);
-  useEffect(() => {
-    if (!isTauri() || cloudProfileCheckedRef.current) return;
-    cloudProfileCheckedRef.current = true;
-    let active = true;
-    void getInferenceSource()
-      .then((source) => {
-        if (!active) return;
-        if (initialCloudRoute(false, source) === 'settings') {
-          setSetupDone(true);
-          navigate('/settings', { replace: true });
-        }
-      })
-      .catch(() => {
-        // SetupScreen still reports native boot failures if the source cannot be read.
-      })
-      .finally(() => {
-        if (active) setCheckingCloudProfile(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [navigate]);
+  }, []);
   const prevModelRef = useRef<string>('');
   const setModels = useAppStore((s) => s.setModels);
   const setModelsLoading = useAppStore((s) => s.setModelsLoading);
@@ -212,10 +185,6 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [commandPaletteOpen, setCommandPaletteOpen, toggleSystemPanel]);
 
-
-  if (checkingCloudProfile) {
-    return null;
-  }
 
   if (!setupDone) {
     return (
