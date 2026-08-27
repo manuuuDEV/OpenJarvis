@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 TAURI_CONFIG = ROOT / "frontend" / "src-tauri" / "tauri.conf.json"
 MACOS_INFO_PLIST = ROOT / "frontend" / "src-tauri" / "Info.plist"
 DESKTOP_WORKFLOW = ROOT / ".github" / "workflows" / "desktop.yml"
+VITE_CONFIG = ROOT / "frontend" / "vite.config.ts"
 
 
 def _csp_sources(directive: str) -> set[str]:
@@ -40,6 +41,23 @@ def test_macos_webview_allows_user_configured_http_servers() -> None:
     info = plistlib.loads(MACOS_INFO_PLIST.read_bytes())
 
     assert info["NSAppTransportSecurity"]["NSAllowsArbitraryLoadsInWebContent"] is True
+
+
+def test_desktop_bundle_uses_a_fresh_webview_data_directory() -> None:
+    """A desktop upgrade must not reuse the legacy PWA-controlled WebView store."""
+    config = json.loads(TAURI_CONFIG.read_text(encoding="utf-8"))
+
+    window = config["app"]["windows"][0]
+    assert window["dataDirectory"] == "openjarvis-desktop-ui-v2"
+
+
+def test_desktop_build_does_not_generate_a_pwa_service_worker() -> None:
+    """PWA remains a web-only feature; Tauri must package direct local assets."""
+    vite_config = VITE_CONFIG.read_text(encoding="utf-8")
+
+    assert "TAURI_ENV_PLATFORM" in vite_config
+    assert "...(!isTauriBuild" in vite_config
+    assert "VitePWA" in vite_config
 
 
 def test_local_build_does_not_require_updater_signing_key() -> None:

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OpenJarvis",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "identifier": "com.openjarvis.desktop.cloud",
   "build": {
     "frontendDist": "../dist",
@@ -20,7 +20,8 @@
         "resizable": true,
         "fullscreen": false,
         "decorations": true,
-        "transparent": false
+        "transparent": false,
+        "dataDirectory": "openjarvis-desktop-ui-v2"
       }
     ],
     "security": {

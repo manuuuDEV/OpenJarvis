@@ -7,6 +7,14 @@ import { VitePWA } from 'vite-plugin-pwa';
 // VITE_SUPABASE_ANON_KEY is intentionally NOT required here: a missing key
 // disables the savings leaderboard at runtime (see src/lib/supabase.ts) rather
 // than failing the build, so the package/app stays publishable without it.
+//
+// A Tauri WebView must load the resources packaged by the installer. A PWA
+// service worker has a separate, persistent cache and previously served an
+// upstream/legacy Settings bundle after an app upgrade. Keep PWA support for a
+// browser build, but never generate or register a service worker in a desktop
+// bundle. Tauri sets TAURI_ENV_PLATFORM for beforeBuildCommand hooks.
+const isTauriBuild = Boolean(process.env.TAURI_ENV_PLATFORM);
+
 export default defineConfig({
   resolve: {
     alias: {
@@ -16,25 +24,29 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
-    VitePWA({
-      registerType: 'autoUpdate',
-      manifest: {
-        name: 'OpenJarvis',
-        short_name: 'Jarvis',
-        description: 'On-device AI assistant',
-        theme_color: '#161618',
-        background_color: '#161618',
-        display: 'standalone',
-        icons: [
-          { src: 'pwa-192x192.png', sizes: '192x192', type: 'image/png' },
-          { src: 'pwa-512x512.png', sizes: '512x512', type: 'image/png' },
-        ],
-      },
-      workbox: {
-        globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
-        navigateFallbackDenylist: [/^\/v1\//, /^\/health/, /^\/dashboard/, /^\/api\//],
-      },
-    }),
+    ...(!isTauriBuild
+      ? [
+          VitePWA({
+            registerType: 'autoUpdate',
+            manifest: {
+              name: 'OpenJarvis',
+              short_name: 'Jarvis',
+              description: 'On-device AI assistant',
+              theme_color: '#161618',
+              background_color: '#161618',
+              display: 'standalone',
+              icons: [
+                { src: 'pwa-192x192.png', sizes: '192x192', type: 'image/png' },
+                { src: 'pwa-512x512.png', sizes: '512x512', type: 'image/png' },
+              ],
+            },
+            workbox: {
+              globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
+              navigateFallbackDenylist: [/^\/v1\//, /^\/health/, /^\/dashboard/, /^\/api\//],
+            },
+          }),
+        ]
+      : []),
   ],
   build: {
     outDir: '../src/openjarvis/server/static',
