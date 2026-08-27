@@ -9,10 +9,21 @@ import { serializeToolCallArguments } from './tool-call';
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown;
+    __TAURI__?: unknown;
   }
 }
 
-export const isTauri = () => typeof window !== 'undefined' && !!window.__TAURI_INTERNALS__;
+/**
+ * Detect the native Tauri runtime without assuming that its internal bridge is
+ * the only global exposed by a production WebView. The desktop bundle enables
+ * the supported `window.__TAURI__` global and retains the internal bridge as a
+ * compatibility signal; a normal browser has neither.
+ */
+export const detectTauriRuntime = (runtime: Window | undefined): boolean =>
+  Boolean(runtime?.__TAURI_INTERNALS__ || runtime?.__TAURI__);
+
+export const isTauri = () =>
+  typeof window !== 'undefined' && detectTauriRuntime(window);
 
 export type CloudKeyStatus = Record<string, boolean>;
 

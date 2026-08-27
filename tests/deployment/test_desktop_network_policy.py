@@ -48,6 +48,7 @@ def test_desktop_bundle_uses_a_fresh_webview_data_directory() -> None:
     config = json.loads(TAURI_CONFIG.read_text(encoding="utf-8"))
 
     window = config["app"]["windows"][0]
+    assert config["app"]["withGlobalTauri"] is True
     assert window["dataDirectory"] == "openjarvis-desktop-ui-v2"
 
 

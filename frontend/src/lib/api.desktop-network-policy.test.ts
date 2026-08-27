@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { selectApiBase } from './api';
+import { detectTauriRuntime, selectApiBase } from './api';
+
+describe('detectTauriRuntime', () => {
+  it('recognizes the official Tauri global when an internal bridge is not exposed', () => {
+    expect(detectTauriRuntime({ __TAURI__: {} } as Window)).toBe(true);
+  });
+
+  it('recognizes the legacy internal bridge and rejects a normal browser runtime', () => {
+    expect(detectTauriRuntime({ __TAURI_INTERNALS__: {} } as Window)).toBe(true);
+    expect(detectTauriRuntime(undefined)).toBe(false);
+    expect(detectTauriRuntime({} as Window)).toBe(false);
+  });
+});
 
 describe('selectApiBase', () => {
   it('keeps the packaged desktop on its native local backend despite a legacy remote setting', () => {
