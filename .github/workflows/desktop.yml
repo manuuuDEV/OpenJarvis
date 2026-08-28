@@ -481,7 +481,7 @@ jobs:
           # reads this env var at build time only. Normal releases leave it
           # empty, which tree-shakes the diagnostic code out entirely.
           OPENJARVIS_BUILD: ${{ inputs.diagnostic == true && 'diag' || '' }}
-        run: npx tauri build --bundles msi,nsis
+        run: npx tauri build --bundles ${{ inputs.diagnostic == true && 'nsis' || 'msi,nsis' }}
 
       - name: Upload private Windows installers
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
