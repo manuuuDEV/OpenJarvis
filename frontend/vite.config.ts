@@ -14,6 +14,14 @@ import { VitePWA } from 'vite-plugin-pwa';
 // browser build, but never generate or register a service worker in a desktop
 // bundle. Tauri sets TAURI_ENV_PLATFORM for beforeBuildCommand hooks.
 const isTauriBuild = Boolean(process.env.TAURI_ENV_PLATFORM);
+// Diagnostic build: set OPENJARVIS_BUILD=diag in the build environment to
+// compile the diagnostic UI (Settings -> Diagnostics section, passive
+// observer) into the bundle. The flag is read at build time only; there
+// is no runtime check, no URL flag, and no DevTools step. A diagnostic
+// build is a separate version (e.g. 1.0.12-diag.1), distinct from the
+// shipping version, so an installation and its WebView2 cache are never
+// ambiguous between diagnostic and production.
+const isDiagBuild = process.env.OPENJARVIS_BUILD === 'diag';
 
 export default defineConfig({
   // This value is compiled into the renderer. It is intentionally not inferred
@@ -21,6 +29,7 @@ export default defineConfig({
   // marker before the application UI renders.
   define: {
     __OPENJARVIS_DESKTOP_BUILD__: JSON.stringify(isTauriBuild),
+    __OPENJARVIS_DIAG_BUILD__: JSON.stringify(isDiagBuild),
   },
   resolve: {
     alias: {

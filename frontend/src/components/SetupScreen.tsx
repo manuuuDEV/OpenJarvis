@@ -9,6 +9,7 @@ import {
 } from '../lib/api';
 import { useAppStore } from '../lib/store';
 import { isEmbedOnlyModel } from '../lib/model-capabilities';
+import { isDiagBuild, noteSetupStatus, recordDiag } from '../lib/diag';
 
 const STEPS = [
   { key: 'ollama_ready', label: 'Inference Engine', icon: Cpu, detail: 'Starting Ollama...' },
@@ -88,6 +89,20 @@ export function SetupScreen({
   const poll = useCallback(async () => {
     const s = await getSetupStatus();
     if (s) setStatus(s);
+    // Diagnostic: record a `setup-status-present` entry whenever the
+    // phase or source value changes. The error text is NOT recorded;
+    // only the two enumerated values. The user's diagnostic requirement
+    // is the boolean fact + the two enums, nothing more.
+    if (isDiagBuild() && s) {
+      const result = noteSetupStatus(s.phase, s.source ?? 'unknown');
+      if (result.changed) {
+        recordDiag({
+          kind: 'setup-status-present',
+          setupPhase: result.phase,
+          setupSource: result.source,
+        });
+      }
+    }
     if (cloudConfigurationRequired(s) && !handedOffRef.current) {
       handedOffRef.current = true;
       onConfigurationRequired();

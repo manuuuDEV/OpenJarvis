@@ -11,6 +11,7 @@ import { LogsPage } from './pages/LogsPage';
 import { CommandPalette } from './components/CommandPalette';
 import { SetupScreen } from './components/SetupScreen';
 import { Toaster } from './components/ui/sonner';
+import { DiagObserver } from './components/DiagObserver';
 import { useAppStore } from './lib/store';
 import {
   fetchModels,
@@ -188,15 +189,19 @@ export default function App() {
 
   if (!setupDone) {
     return (
-      <SetupScreen
-        onReady={handleSetupReady}
-        onConfigurationRequired={handleCloudConfigurationRequired}
-      />
+      <>
+        <DiagObserver />
+        <SetupScreen
+          onReady={handleSetupReady}
+          onConfigurationRequired={handleCloudConfigurationRequired}
+        />
+      </>
     );
   }
 
   return (
     <>
+      <DiagObserver />
       <Routes>
         <Route element={<Layout />}>
           <Route index element={<ChatPage />} />

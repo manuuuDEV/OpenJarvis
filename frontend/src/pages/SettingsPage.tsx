@@ -18,6 +18,7 @@ import {
   Brain,
 } from 'lucide-react';
 import { useAppStore, type ThemeMode } from '../lib/store';
+import { dumpDiag, isDiagBuild, isRecording, startRecording, stopRecording } from '../lib/diag';
 import {
   checkHealth,
   fetchSpeechHealth,
@@ -1198,6 +1199,69 @@ export function SettingsPage() {
               </button>
             </SettingRow>
           </Section>
+
+          {/* Diagnostic build only: capture a redacted navigation timeline.
+              Renders nothing in the shipping 1.0.11 build. The captured
+              JSON contains ONLY t / kind / pathname / mountCount /
+              setupPhase / setupSource — no error text, no stack frames,
+              no API keys, no full URLs, no file paths. The "Download
+              JSON" button uses the same Blob + a.click() pattern as the
+              "Export conversations" button above, so no Tauri dialog
+              plugin is required. */}
+          {isDiagBuild() && (
+            <Section title="Diagnostics (diagnostic build only)">
+              <p className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
+                Captures mount / unmount, pathname changes, popstate,
+                hashchange, beforeunload, pagehide, visibilitychange, the
+                boolean fact that an error was caught, and the setup
+                phase / source enums. The downloaded file contains only
+                those fields.
+              </p>
+              <div className="flex flex-wrap gap-2 mb-2">
+                <button
+                  type="button"
+                  onClick={() => startRecording()}
+                  disabled={isRecording()}
+                  className="px-3 py-2 rounded text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+                  style={{ background: 'var(--color-accent-subtle)', color: 'var(--color-text)' }}
+                >
+                  Start recording
+                </button>
+                <button
+                  type="button"
+                  onClick={() => stopRecording()}
+                  disabled={!isRecording()}
+                  className="px-3 py-2 rounded text-xs font-medium transition-colors cursor-pointer disabled:opacity-50"
+                  style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)' }}
+                >
+                  Stop recording
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const json = dumpDiag();
+                    const blob = new Blob([json], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `openjarvis-diag-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                  }}
+                  className="px-3 py-2 rounded text-xs font-medium transition-colors cursor-pointer"
+                  style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)' }}
+                >
+                  Download JSON (web download)
+                </button>
+              </div>
+              <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+                Recording is currently {isRecording() ? 'on' : 'off'}. The
+                downloaded file is local-only; no telemetry is sent.
+              </p>
+            </Section>
+          )}
 
           {/* About */}
           <Section title="About">

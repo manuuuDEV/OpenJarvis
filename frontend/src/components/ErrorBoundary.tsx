@@ -1,6 +1,7 @@
 import { Component } from 'react';
 import type { ReactNode, ErrorInfo } from 'react';
 import { AlertTriangle, RotateCcw } from 'lucide-react';
+import { notifyDiagErrorPresent } from './DiagObserver';
 
 interface Props {
   children: ReactNode;
@@ -22,6 +23,12 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
+    // Diagnostic: record only the boolean fact that an error was caught.
+    // The error message, name, and stack are intentionally NOT recorded
+    // because they can contain file paths, API keys, or user content.
+    notifyDiagErrorPresent();
+    // The console log is preserved for human debug only and is not part
+    // of the diagnostic timeline.
     console.error('ErrorBoundary caught:', error, info);
   }
 

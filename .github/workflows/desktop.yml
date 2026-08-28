@@ -16,6 +16,11 @@ on:
         description: 'Tag to build (e.g. v1.0.2.dev500). If set, autotag dispatches use this. github.ref still controls the checkout.'
         required: false
         type: string
+      diagnostic:
+        description: 'Build a DIAGNOSTIC renderer bundle (compiles the Settings -> Diagnostics timeline recorder into the bundle). Set this only for a distinct diagnostic version (e.g. 1.0.12-diag.1); leave false for a normal release.'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: desktop-${{ inputs.tag || github.ref }}
@@ -470,6 +475,12 @@ jobs:
         env:
           TAURI_CONFIG: '{"bundle":{"createUpdaterArtifacts":false}}'
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          # Diagnostic renderer bundle: when the workflow is dispatched with
+          # `diagnostic: true`, compile the passive navigation timeline
+          # recorder (Settings -> Diagnostics) into the bundle. vite.config.ts
+          # reads this env var at build time only. Normal releases leave it
+          # empty, which tree-shakes the diagnostic code out entirely.
+          OPENJARVIS_BUILD: ${{ inputs.diagnostic == true && 'diag' || '' }}
         run: npx tauri build --bundles msi,nsis
 
       - name: Upload private Windows installers
