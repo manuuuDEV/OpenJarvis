@@ -2472,7 +2472,12 @@ enum SourceKind {
 
 impl Default for SourceKind {
     fn default() -> Self {
-        SourceKind::Cloud
+        // A fresh install boots a local Ollama model so the backend starts
+        // without any cloud configuration. Cloud remains selectable, but it
+        // must never be the implicit default — the cloud engine is blocked by
+        // the outbound privacy policy until the user grants explicit consent,
+        // which would otherwise leave the server unable to reach `ready`.
+        SourceKind::Ollama
     }
 }
 
@@ -3001,17 +3006,17 @@ async fn set_controlled_folders(folders: Vec<String>) -> Result<Vec<String>, Str
 }
 
 /// Parse config text. A missing or invalid `kind` (or a missing file) falls
-/// back to the serde default (Cloud); an explicit Ollama/Custom selection
-/// round-trips so the local backend can boot without cloud configuration.
+/// back to the serde default (Ollama — a local engine that boots without any
+/// cloud consent); an explicit Ollama/Custom/Cloud selection round-trips so
+/// the backend can start from the user's chosen source.
 fn parse_inference_config(text: &str) -> InferenceConfig {
     // Parse the on-disk config verbatim. A missing or invalid `kind` field
-    // falls back to the serde default (Cloud) only because there is no other
-    // viable default for an absent value; a user's explicit Ollama/Custom
-    // selection must round-trip unchanged so the local backend can boot.
+    // falls back to the serde default (Ollama); a user's explicit selection
+    // must round-trip unchanged so the local backend can boot.
     serde_json::from_str::<InferenceConfig>(text).unwrap_or_default()
 }
 
-/// Read the on-disk inference config, or the cloud default if absent.
+/// Read the on-disk inference config, or the Ollama default if absent.
 fn read_inference_config() -> InferenceConfig {
     match std::fs::read_to_string(inference_config_path()) {
         Ok(text) => parse_inference_config(&text),
@@ -3887,9 +3892,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_defaults_to_cloud_when_file_missing_or_garbage() {
-        assert!(matches!(parse_inference_config("").kind, SourceKind::Cloud));
-        assert!(matches!(parse_inference_config("not json").kind, SourceKind::Cloud));
+    fn parse_defaults_to_ollama_when_file_missing_or_garbage() {
+        assert!(matches!(parse_inference_config("").kind, SourceKind::Ollama));
+        assert!(matches!(parse_inference_config("not json").kind, SourceKind::Ollama));
     }
 
     #[test]
