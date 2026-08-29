@@ -42,6 +42,7 @@ import {
   deleteToolCredential,
   isTauri,
   type CloudProvider,
+  type InferenceSourceKind,
   type AndroidAdbDevice,
   type SecureSelfTestReport,
   type ExecutionGuardStatus,
@@ -246,10 +247,13 @@ export function SettingsPage() {
     try { return parseInt(localStorage.getItem('openjarvis-memory-max-tokens') || '2048'); } catch { return 2048; }
   });
 
+  const [sourceKind, setSourceKind] = useState<InferenceSourceKind>('cloud');
   const [cloudProvider, setCloudProvider] = useState<CloudProvider>('openai');
   const [cloudModel, setCloudModel] = useState('');
   const [cloudKey, setCloudKey] = useState('');
   const [cloudEndpoint, setCloudEndpoint] = useState('');
+  const [customHost, setCustomHost] = useState('');
+  const [customEngine, setCustomEngine] = useState('');
   const [transcriptionProvider, setTranscriptionProvider] = useState<TranscriptionProvider>('');
   const [transcriptionModel, setTranscriptionModel] = useState<TranscriptionModel>('whisper-large-v3-turbo');
   const [transcriptionProcessingAcknowledged, setTranscriptionProcessingAcknowledged] = useState(false);
@@ -285,9 +289,12 @@ export function SettingsPage() {
 
   useEffect(() => {
     getInferenceSource().then((s) => {
+      if (s.kind) setSourceKind(s.kind);
       if (s.provider) setCloudProvider(s.provider);
       if (s.model) setCloudModel(s.model);
       if (s.providerEndpoint) setCloudEndpoint(s.providerEndpoint);
+      if (s.host) setCustomHost(s.host);
+      if (s.engine) setCustomEngine(s.engine);
       setProviderProcessingAcknowledged(!!s.providerProcessingAcknowledged);
     }).catch(() => {});
     getTranscriptionSource().then((s) => {
@@ -311,6 +318,28 @@ export function SettingsPage() {
 
   const saveSource = useCallback(async () => {
     try {
+      if (sourceKind === 'ollama') {
+        await setInferenceSource({
+          kind: 'ollama',
+          model: cloudModel || undefined,
+          providerProcessingAcknowledged: false,
+        });
+        setCloudKey('');
+        setSrcMsg('Local Ollama source saved. Restart the app to apply.');
+        return;
+      }
+      if (sourceKind === 'custom') {
+        await setInferenceSource({
+          kind: 'custom',
+          model: cloudModel || undefined,
+          host: customHost || undefined,
+          engine: customEngine || undefined,
+          providerProcessingAcknowledged: false,
+        });
+        setCloudKey('');
+        setSrcMsg('Custom local endpoint saved. Restart the app to apply.');
+        return;
+      }
       await setInferenceSource({
         kind: 'cloud',
         provider: cloudProvider,
@@ -324,7 +353,7 @@ export function SettingsPage() {
     } catch (e: any) {
       setSrcMsg(e?.message ?? 'Failed to save.');
     }
-  }, [cloudProvider, cloudModel, cloudKey, cloudEndpoint, providerProcessingAcknowledged]);
+  }, [sourceKind, cloudProvider, cloudModel, cloudKey, cloudEndpoint, customHost, customEngine, providerProcessingAcknowledged]);
 
   const selectedProvider = CLOUD_PROVIDER_OPTIONS.find((item) => item.id === cloudProvider) ?? CLOUD_PROVIDER_OPTIONS[0];
 
@@ -728,63 +757,127 @@ export function SettingsPage() {
             )}
           </Section>
 
-          {/* Cloud-only inference */}
-          <Section title="Authorized cloud inference">
+          {/* Inference source */}
+          <Section title="Inference source">
             <p className="text-xs mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
-              This build does not install, start, or download local models. Requests use TLS in transit; the selected provider processes the prompt and response within its own inference boundary.
+              Scegli dove il backend locale invia le richieste di inferenza. Ollama usa modelli locali; un endpoint personalizzato punta a un server OpenAI-compatibile (LM Studio, etc.); il cloud usa un provider autorizzato via TLS.
             </p>
-            <SettingRow label="Provider attivo" description="Un solo provider viene autorizzato e inviato al backend alla volta; le altre chiavi restano isolate nel portachiavi.">
+            <SettingRow label="Sorgente" description="Il backend locale si avvia comunque; la scelta imposta soltanto il motore di inferenza.">
               <select
-                value={cloudProvider}
+                value={sourceKind}
                 onChange={(e) => {
-                  const next = e.target.value as CloudProvider;
-                  setCloudProvider(next);
-                  setCloudEndpoint('');
+                  setSourceKind(e.target.value as InferenceSourceKind);
                   setSrcMsg('');
                 }}
                 className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
                 style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
               >
-                {CLOUD_PROVIDER_OPTIONS.map((provider) => (
-                  <option key={provider.id} value={provider.id}>{provider.label}</option>
-                ))}
+                <option value="ollama">Local (Ollama)</option>
+                <option value="custom">Custom local endpoint</option>
+                <option value="cloud">Authorized cloud provider</option>
               </select>
             </SettingRow>
-            <SettingRow label="Modello" description="Inserisci un modello appartenente al provider attivo; non esiste fallback automatico verso altri provider.">
-              <input type="text" value={cloudModel} onChange={(e) => { setCloudModel(e.target.value); setSrcMsg(''); }} placeholder="Modello del provider"
-                className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
-            </SettingRow>
-            {selectedProvider.endpointRequired && (
-              <SettingRow label="Endpoint del provider" description={selectedProvider.endpointHint}>
-                <input type="url" value={cloudEndpoint} onChange={(e) => { setCloudEndpoint(e.target.value); setSrcMsg(''); }} placeholder="https://..."
-                  autoComplete="off" className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                  style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
-              </SettingRow>
+
+            {sourceKind === 'ollama' && (
+              <>
+                <SettingRow label="Modello Ollama" description="Lascia vuoto per usare il modello locale consigliato in base alla RAM.">
+                  <input type="text" value={cloudModel} onChange={(e) => { setCloudModel(e.target.value); setSrcMsg(''); }} placeholder="es. qwen3.5:4b"
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+                </SettingRow>
+                <SettingRow label="" description={srcMsg}>
+                  <button onClick={saveSource}
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
+                    style={{ background: 'var(--color-accent, var(--color-bg-tertiary))', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}>
+                    Save local Ollama source
+                  </button>
+                </SettingRow>
+              </>
             )}
-            <SettingRow label={`${selectedProvider.label} API key`} description="Salvata solo nel portachiavi di Windows; mai nel repository, file di configurazione o log.">
-              <input type="password" value={cloudKey} onChange={(e) => { setCloudKey(e.target.value); setSrcMsg(''); }} placeholder={selectedProvider.keyPlaceholder}
-                autoComplete="off" className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
-                style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
-            </SettingRow>
-            <SettingRow label="Provider processing acknowledgement" description="I understand that TLS protects the connection in transit, but the selected cloud provider processes prompts and responses. Do not include data you are not authorized to share.">
-              <label className="flex items-start gap-2 max-w-xs text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-                <input
-                  type="checkbox"
-                  checked={providerProcessingAcknowledged}
-                  onChange={(e) => { setProviderProcessingAcknowledged(e.target.checked); setSrcMsg(''); }}
-                  className="mt-0.5"
-                />
-                <span>I explicitly authorize this provider for the selected model.</span>
-              </label>
-            </SettingRow>
-            <SettingRow label="" description={srcMsg}>
-              <button onClick={saveSource} disabled={!providerProcessingAcknowledged}
-                className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
-                style={{ background: 'var(--color-accent, var(--color-bg-tertiary))', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}>
-                Save authorized cloud profile
-              </button>
-            </SettingRow>
+
+            {sourceKind === 'custom' && (
+              <>
+                <SettingRow label="URL del server" description="Base URL OpenAI-compatibile (es. http://localhost:1234).">
+                  <input type="url" value={customHost} onChange={(e) => { setCustomHost(e.target.value); setSrcMsg(''); }} placeholder="http://localhost:1234"
+                    autoComplete="off" className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+                </SettingRow>
+                <SettingRow label="Engine" description="Chiave motore OpenAI-compatibile (default: lmstudio).">
+                  <input type="text" value={customEngine} onChange={(e) => { setCustomEngine(e.target.value); setSrcMsg(''); }} placeholder="lmstudio"
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+                </SettingRow>
+                <SettingRow label="Modello" description="Identificatore modello esposto dall'endpoint.">
+                  <input type="text" value={cloudModel} onChange={(e) => { setCloudModel(e.target.value); setSrcMsg(''); }} placeholder="modello"
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+                </SettingRow>
+                <SettingRow label="" description={srcMsg}>
+                  <button onClick={saveSource}
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
+                    style={{ background: 'var(--color-accent, var(--color-bg-tertiary))', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}>
+                    Save custom endpoint
+                  </button>
+                </SettingRow>
+              </>
+            )}
+
+            {sourceKind === 'cloud' && (
+              <>
+                <SettingRow label="Provider attivo" description="Un solo provider viene autorizzato e inviato al backend alla volta; le altre chiavi restano isolate nel portachiavi.">
+                  <select
+                    value={cloudProvider}
+                    onChange={(e) => {
+                      const next = e.target.value as CloudProvider;
+                      setCloudProvider(next);
+                      setCloudEndpoint('');
+                      setSrcMsg('');
+                    }}
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+                  >
+                    {CLOUD_PROVIDER_OPTIONS.map((provider) => (
+                      <option key={provider.id} value={provider.id}>{provider.label}</option>
+                    ))}
+                  </select>
+                </SettingRow>
+                <SettingRow label="Modello" description="Inserisci un modello appartenente al provider attivo; non esiste fallback automatico verso altri provider.">
+                  <input type="text" value={cloudModel} onChange={(e) => { setCloudModel(e.target.value); setSrcMsg(''); }} placeholder="Modello del provider"
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+                </SettingRow>
+                {selectedProvider.endpointRequired && (
+                  <SettingRow label="Endpoint del provider" description={selectedProvider.endpointHint}>
+                    <input type="url" value={cloudEndpoint} onChange={(e) => { setCloudEndpoint(e.target.value); setSrcMsg(''); }} placeholder="https://..."
+                      autoComplete="off" className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                      style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+                  </SettingRow>
+                )}
+                <SettingRow label={`${selectedProvider.label} API key`} description="Salvata solo nel portachiavi di Windows; mai nel repository, file di configurazione o log.">
+                  <input type="password" value={cloudKey} onChange={(e) => { setCloudKey(e.target.value); setSrcMsg(''); }} placeholder={selectedProvider.keyPlaceholder}
+                    autoComplete="off" className="text-sm px-3 py-1.5 rounded-lg outline-none w-56"
+                    style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }} />
+                </SettingRow>
+                <SettingRow label="Provider processing acknowledgement" description="I understand that TLS protects the connection in transit, but the selected cloud provider processes prompts and responses. Do not include data you are not authorized to share.">
+                  <label className="flex items-start gap-2 max-w-xs text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                    <input
+                      type="checkbox"
+                      checked={providerProcessingAcknowledged}
+                      onChange={(e) => { setProviderProcessingAcknowledged(e.target.checked); setSrcMsg(''); }}
+                      className="mt-0.5"
+                    />
+                    <span>I explicitly authorize this provider for the selected model.</span>
+                  </label>
+                </SettingRow>
+                <SettingRow label="" description={srcMsg}>
+                  <button onClick={saveSource} disabled={!providerProcessingAcknowledged}
+                    className="text-sm px-3 py-1.5 rounded-lg outline-none cursor-pointer"
+                    style={{ background: 'var(--color-accent, var(--color-bg-tertiary))', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}>
+                    Save authorized cloud profile
+                  </button>
+                </SettingRow>
+              </>
+            )}
           </Section>
 
           <Section title="Diagnostica Android ADB controllata">

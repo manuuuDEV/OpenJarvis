@@ -1396,9 +1396,15 @@ export type CloudProvider =
   | 'huggingface'
   | 'together';
 
+export type InferenceSourceKind = 'cloud' | 'ollama' | 'custom';
+
 export type InferenceSource = {
-  kind: 'cloud';
+  kind: InferenceSourceKind;
   model?: string;
+  /** Bare base URL for a custom/local OpenAI-compatible endpoint. */
+  host?: string;
+  /** OpenAI-compatible engine key (e.g. "lmstudio"), custom only. */
+  engine?: string;
   provider?: CloudProvider;
   providerEndpoint?: string;
   providerProcessingAcknowledged?: boolean;
@@ -1440,8 +1446,8 @@ export async function setInferenceSource(
     await invoke<void>('set_inference_source', {
       kind: src.kind,
       model: src.model ?? null,
-      host: null,
-      engine: null,
+      host: src.host ?? null,
+      engine: src.engine ?? null,
       provider: src.provider ?? null,
       apiKey: src.apiKey ?? null,
       providerEndpoint: src.providerEndpoint ?? null,

@@ -34,12 +34,9 @@ export default function App() {
     }
   }, []);
   // A missing cloud profile is an onboarding state, never a route guard.
-  // SetupScreen will hand off to the application, but navigation to Settings
-  // is always initiated by an explicit click. This prevents a native status
-  // refresh or an App remount from trapping the user on the Settings route.
-  const handleCloudConfigurationRequired = useCallback(() => {
-    setSetupDone(true);
-  }, []);
+  // SetupScreen hands off to the app only when the local backend reports
+  // `phase === 'ready'`. Navigation to Settings is always initiated by an
+  // explicit click, never by a native status refresh or an App remount.
   const prevModelRef = useRef<string>('');
   const setModels = useAppStore((s) => s.setModels);
   const setModelsLoading = useAppStore((s) => s.setModelsLoading);
@@ -190,7 +187,6 @@ export default function App() {
     return (
       <SetupScreen
         onReady={handleSetupReady}
-        onConfigurationRequired={handleCloudConfigurationRequired}
       />
     );
   }

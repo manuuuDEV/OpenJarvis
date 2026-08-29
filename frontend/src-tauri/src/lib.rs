@@ -956,7 +956,9 @@ fn check_jarvis_port_available() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
-    // Decide the inference source (default Ollama) before launching anything.
+    // Decide the inference source before launching anything. Cloud is the
+    // default kind when no config is present, but it must not block the local
+    // server: the provider is only consulted for actual cloud requests.
     let cfg = read_inference_config();
     let plan = boot_plan(&cfg, total_ram_gb());
     {
@@ -1092,48 +1094,58 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
             s.detail = "Model ready.".into();
         }
     } else if cfg.kind == SourceKind::Cloud {
+        // Cloud is the default inference source, but it must never block the
+        // local backend from starting. A fresh install with no configured
+        // provider (or an explicit but not-yet-keyed provider) still boots
+        // `jarvis serve` so the app is usable; the provider is only consulted
+        // when a request actually needs the cloud path. We validate and
+        // authorize a configured provider opportunistically, without ever
+        // returning early and halting the server.
         let provider = cfg.provider.clone().unwrap_or_default();
         let model = cfg.model.clone().unwrap_or_default();
-        if provider.is_empty() || model.is_empty() {
+        if !provider.is_empty() {
+            let mut block_reason: Option<String> = None;
+            if model.is_empty() {
+                block_reason = Some("Choose a cloud model in Settings before sending a cloud request.".into());
+            } else if let Err(error) = validate_cloud_provider(&provider) {
+                block_reason = Some(error);
+            } else if cloud_api_key_name(&provider).is_none() {
+                block_reason =
+                    Some("The selected cloud provider has no supported credential mapping.".into());
+            } else if !matches!(secure_store_get(
+                cloud_api_key_name(&provider).expect("checked above")
+            ), Ok(Some(value)) if !value.is_empty()) {
+                block_reason = Some(format!(
+                    "Add the API key for the authorized provider ({}) in Settings before sending a cloud request.",
+                    provider
+                ));
+            }
+
+            match block_reason {
+                Some(reason) => {
+                    let mut s = status.lock().await;
+                    s.phase = "model".into();
+                    s.ollama_ready = true;
+                    s.model_ready = true;
+                    s.detail = reason;
+                }
+                None => {
+                    let _ = set_cloud_privacy_config(&provider);
+                    let mut s = status.lock().await;
+                    s.phase = "model".into();
+                    s.ollama_ready = true;
+                    s.model_ready = true;
+                    s.detail =
+                        format!("Cloud provider {} authorized with TLS required.", provider);
+                }
+            }
+        } else {
             let mut s = status.lock().await;
-            s.phase = "configuration_required".into();
-            s.error = Some(
-                "Choose one authorized cloud provider and model in Settings before starting OpenJarvis."
-                    .into(),
-            );
-            return;
+            s.phase = "model".into();
+            s.ollama_ready = true;
+            s.model_ready = true;
+            s.detail = "No cloud provider configured; local server is running.".into();
         }
-        if let Err(error) = validate_cloud_provider(&provider) {
-            let mut s = status.lock().await;
-            s.phase = "configuration_required".into();
-            s.error = Some(error);
-            return;
-        }
-        let Some(key_name) = cloud_api_key_name(&provider) else {
-            let mut s = status.lock().await;
-            s.phase = "configuration_required".into();
-            s.error = Some("The selected cloud provider has no supported credential mapping.".into());
-            return;
-        };
-        if !matches!(secure_store_get(key_name), Ok(Some(value)) if !value.is_empty()) {
-            let mut s = status.lock().await;
-            s.phase = "configuration_required".into();
-            s.error = Some(format!(
-                "Add the API key for the authorized provider ({}) in Settings before starting OpenJarvis.",
-                provider
-            ));
-            return;
-        }
-        if let Err(error) = set_cloud_privacy_config(&provider) {
-            let mut s = status.lock().await;
-            s.error = Some(error);
-            return;
-        }
-        let mut s = status.lock().await;
-        s.phase = "model".into();
-        s.ollama_ready = true;
-        s.model_ready = true;
-        s.detail = format!("Cloud provider {} authorized with TLS required.", provider);
     } else {
         // Legacy custom endpoint: never start Ollama, never download.
         let host = plan
@@ -1727,11 +1739,18 @@ async fn run_secure_self_test() -> Result<SecureSelfTestReport, String> {
     let inference = read_inference_config();
 
     if inference.kind != SourceKind::Cloud {
+        // A local (Ollama/custom) source is a fully supported configuration;
+        // no warning is required.
+        let label = match inference.kind {
+            SourceKind::Ollama => "Modello locale (Ollama)",
+            SourceKind::Custom => "Endpoint locale personalizzato",
+            SourceKind::Cloud => unreachable!(),
+        };
         checks.push(secure_self_test_check(
-            "cloud-profile",
-            "warning",
-            "Profilo cloud",
-            "Il profilo desktop sicuro richiede un provider cloud esplicito.",
+            "local-inference",
+            "pass",
+            label,
+            "L'inferenza locale è selezionata; nessun provider cloud è richiesto.",
         ));
     } else if let Some(provider) = inference.provider.as_deref() {
         let key_present = cloud_api_key_name(provider)
@@ -1764,7 +1783,7 @@ async fn run_secure_self_test() -> Result<SecureSelfTestReport, String> {
             "cloud-provider",
             "not_configured",
             "Provider cloud",
-            "Seleziona un provider cloud nelle Impostazioni prima di usare la chat.",
+            "Nessun provider cloud selezionato. Il backend locale resta comunque utilizzabile; il cloud è opzionale.",
         ));
     }
 
@@ -2351,16 +2370,60 @@ async fn get_inference_source() -> Result<InferenceConfig, String> {
 async fn set_inference_source(
     kind: String,
     model: Option<String>,
-    _host: Option<String>,
-    _engine: Option<String>,
+    host: Option<String>,
+    engine: Option<String>,
     provider: Option<String>,
     api_key: Option<String>,
     provider_endpoint: Option<String>,
     provider_processing_acknowledged: bool,
 ) -> Result<(), String> {
-    if kind != "cloud" {
-        return Err("This desktop distribution permits only an explicitly authorized cloud provider.".into());
+    let kind = kind.trim().to_ascii_lowercase();
+    match kind.as_str() {
+        "ollama" => {
+            let model = model.unwrap_or_default().trim().to_string();
+            let cfg = InferenceConfig {
+                kind: SourceKind::Ollama,
+                model: Some(if model.is_empty() {
+                    default_local_model(total_ram_gb()).to_string()
+                } else {
+                    model
+                }),
+                host: None,
+                engine: None,
+                provider: None,
+                provider_endpoint: None,
+                provider_processing_acknowledged: false,
+            };
+            return write_inference_config(&cfg);
+        }
+        "custom" => {
+            let host = host.unwrap_or_default().trim().to_string();
+            let engine = engine
+                .unwrap_or_else(|| CUSTOM_FALLBACK_ENGINE.to_string())
+                .trim()
+                .to_string();
+            let model = model.unwrap_or_default().trim().to_string();
+            let cfg = InferenceConfig {
+                kind: SourceKind::Custom,
+                model: Some(model),
+                host: Some(host),
+                engine: Some(engine),
+                provider: None,
+                provider_endpoint: None,
+                provider_processing_acknowledged: false,
+            };
+            return write_inference_config(&cfg);
+        }
+        "cloud" => {}
+        _ => {
+            return Err(
+                "Unsupported inference source. Choose cloud, ollama, or a custom local endpoint."
+                    .into(),
+            );
+        }
     }
+
+    // Cloud path below — unchanged.
     if !provider_processing_acknowledged {
         return Err(
             "Confirm that TLS protects data in transit while the selected provider processes prompts and responses before saving a cloud profile."
@@ -2937,18 +3000,18 @@ async fn set_controlled_folders(folders: Vec<String>) -> Result<Vec<String>, Str
     Ok(read_controlled_folders())
 }
 
-/// Parse config text. Any missing, invalid, or legacy-local configuration
-/// becomes the cloud-only default, which requires explicit provider consent.
+/// Parse config text. A missing or invalid `kind` (or a missing file) falls
+/// back to the serde default (Cloud); an explicit Ollama/Custom selection
+/// round-trips so the local backend can boot without cloud configuration.
 fn parse_inference_config(text: &str) -> InferenceConfig {
-    let cfg = serde_json::from_str::<InferenceConfig>(text).unwrap_or_default();
-    if matches!(cfg.kind, SourceKind::Ollama | SourceKind::Custom) {
-        InferenceConfig::default()
-    } else {
-        cfg
-    }
+    // Parse the on-disk config verbatim. A missing or invalid `kind` field
+    // falls back to the serde default (Cloud) only because there is no other
+    // viable default for an absent value; a user's explicit Ollama/Custom
+    // selection must round-trip unchanged so the local backend can boot.
+    serde_json::from_str::<InferenceConfig>(text).unwrap_or_default()
 }
 
-/// Read the on-disk inference config, or the cloud-only default if absent.
+/// Read the on-disk inference config, or the cloud default if absent.
 fn read_inference_config() -> InferenceConfig {
     match std::fs::read_to_string(inference_config_path()) {
         Ok(text) => parse_inference_config(&text),
@@ -3824,19 +3887,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_defaults_to_ollama_when_file_missing_or_garbage() {
+    fn parse_defaults_to_cloud_when_file_missing_or_garbage() {
         assert!(matches!(parse_inference_config("").kind, SourceKind::Cloud));
         assert!(matches!(parse_inference_config("not json").kind, SourceKind::Cloud));
     }
 
     #[test]
-    fn parse_legacy_local_config_resets_to_cloud_default() {
+    fn parse_local_config_round_trips_custom() {
         let cfg = parse_inference_config(
             r#"{"kind":"custom","model":"qwen2.5-7b","host":"http://localhost:1234","engine":"lmstudio"}"#,
         );
-        assert!(matches!(cfg.kind, SourceKind::Cloud));
-        assert!(cfg.model.is_none());
-        assert!(cfg.provider.is_none());
+        assert!(matches!(cfg.kind, SourceKind::Custom));
+        assert_eq!(cfg.model.as_deref(), Some("qwen2.5-7b"));
+        assert_eq!(cfg.host.as_deref(), Some("http://localhost:1234"));
+        assert_eq!(cfg.engine.as_deref(), Some("lmstudio"));
+    }
+
+    #[test]
+    fn parse_local_config_round_trips_ollama() {
+        let cfg = parse_inference_config(r#"{"kind":"ollama","model":"qwen3.5:4b"}"#);
+        assert!(matches!(cfg.kind, SourceKind::Ollama));
+        assert_eq!(cfg.model.as_deref(), Some("qwen3.5:4b"));
     }
 
     #[test]
