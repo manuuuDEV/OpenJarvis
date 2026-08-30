@@ -286,14 +286,25 @@ def serve(
             f"{configured_model!r} is not reachable; using {model_name!r}.[/yellow]"
         )
     if not model_name:
-        console.print(
-            "[red]No model available on any reachable engine.[/red]\n\n"
-            "Start an inference backend and make sure it lists at least one model.\n"
-            "For Ollama: [cyan]ollama serve[/cyan] and "
-            "[cyan]ollama pull qwen3.5:9b[/cyan].\n"
-            "For MLX: start the MLX OpenAI-compatible server on the configured host."
+        # No model is installed yet. Do NOT refuse to boot: the desktop app
+        # downloads the smallest model (qwen3.5:0.8b) in the background and
+        # expects the HTTP server to reach `/health` 2xx immediately so the UI
+        # opens instead of blocking on a setup gate. Keep the engine's health
+        # state (Ollama answers `/api/tags` even with zero models) as the sole
+        # readiness signal and hold a placeholder model until the pull lands.
+        model_name = (
+            config.intelligence.default_model
+            or config.intelligence.fallback_model
+            or configured_model
+            or "qwen3.5:0.8b"
         )
-        sys.exit(1)
+        console.print(
+            f"[yellow]No model installed on the reachable engine; "
+            f"serving with placeholder model {model_name!r} while a model is "
+            "downloaded in the background.[/yellow]\n\n"
+            f"While it downloads, requests to {model_name!r} will fail until "
+            "the pull completes."
+        )
 
     # Resolve agent
     agent = None

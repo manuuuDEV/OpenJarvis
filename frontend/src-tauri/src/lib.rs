@@ -91,15 +91,15 @@ fn models_that_fit_in(ram_gb: f64) -> Vec<&'static str> {
         .collect()
 }
 
-/// The default local model: the second-largest Qwen3.5 model that fits in
-/// `ram_gb`. Falls back to the only fitting model, or FALLBACK_MODEL if none
-/// fit. Deliberately NOT the largest — leaves RAM headroom for the OS/app.
+/// The default local model: the SMALLEST Qwen3.5 model that fits in `ram_gb`.
+/// Falls back to FALLBACK_MODEL if none fit. Choosing the smallest model keeps
+/// first-run download small (~1 GB) and avoids surprising a user with a large
+/// automatic download. A user can still pin a specific model in Settings.
 fn default_local_model(ram_gb: f64) -> &'static str {
     let fitting = models_that_fit_in(ram_gb);
     match fitting.len() {
         0 => FALLBACK_MODEL,
-        1 => fitting[0],
-        n => fitting[n - 2],
+        _ => fitting[0],
     }
 }
 
@@ -648,11 +648,6 @@ async fn wait_for_jarvis_health(
     }
 }
 
-async fn ollama_has_model(model: &str) -> bool {
-    let models = ollama_model_names().await;
-    matching_installed_model(&models, model).is_some()
-}
-
 fn parse_ollama_model_names(body: &serde_json::Value) -> Vec<String> {
     body.get("models")
         .and_then(|m| m.as_array())
@@ -1019,7 +1014,9 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         }
 
         // Phase 2: Resolve one model to serve. Prefer an installed model on
-        // first run so startup does not depend on a download succeeding.
+        // first run; when none is installed, kick off the pull in the
+        // background and let the backend start anyway — startup must never
+        // hard-block on a (possibly slow or blocked) model download.
         let model = plan
             .model_to_pull
             .clone()
@@ -1031,67 +1028,61 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         }
 
         let installed_models = ollama_model_names().await;
-        let resolved_model = if let Some(installed) = startup_installed_model(&model, &installed_models) {
-            installed
-        } else {
+        if let Some(installed) = startup_installed_model(&model, &installed_models) {
+            // A usable model is already present — serve it directly.
+            serve_model_override = Some(installed.clone());
+            if installed != model {
+                let mut s = status.lock().await;
+                s.detail = format!("Using installed model {}.", installed);
+            }
             {
                 let mut s = status.lock().await;
-                s.detail = format!("Downloading {}... (this may take a minute)", model);
+                s.model_ready = true;
+                s.detail = "Model ready.".into();
             }
-            match pull_model(&model).await {
-                Ok(()) => model.clone(),
-                Err(e) => {
-                    eprintln!("Warning: failed to pull {}: {}", model, e);
-
-                    // If a local model appeared while pulling, use it instead of
-                    // making startup depend on another network pull.
-                    if let Some(installed) = preferred_installed_model(&ollama_model_names().await) {
-                        installed
-                    } else if ollama_has_model(FALLBACK_MODEL).await {
-                        FALLBACK_MODEL.to_string()
-                    } else {
-                        {
-                            let mut s = status.lock().await;
-                            s.detail = format!("Downloading {}...", FALLBACK_MODEL);
-                        }
-                        if let Err(e2) = pull_model(FALLBACK_MODEL).await {
-                            if let Some(installed) =
-                                preferred_installed_model(&ollama_model_names().await)
-                            {
-                                installed
-                            } else {
-                                let mut s = status.lock().await;
-                                s.error = Some(format!("Failed to download model: {}", e2));
-                                return;
-                            }
-                        } else {
-                            FALLBACK_MODEL.to_string()
-                        }
-                    }
+        } else if installed_models.is_empty() {
+            // No local model at all. Do not block: pull in the background and
+            // let the server come up so the app stays usable. The chat will
+            // become available as soon as the model finishes downloading.
+            {
+                let mut s = status.lock().await;
+                s.model_ready = true;
+                s.detail = format!(
+                    "Downloading {} in the background; the app is ready meanwhile.",
+                    model
+                );
+            }
+            let bg_model = model.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = pull_model(&bg_model).await {
+                    eprintln!("Background model pull for {} failed: {}", bg_model, e);
                 }
+            });
+            // Do not set serve_model_override: keep the plan's `--model`, and
+            // the Python server will come up and report model-not-ready rather
+            // than refusing to boot.
+        } else {
+            // Some models exist but none matches the desired one. Prefer an
+            // installed model so startup does not depend on a download.
+            if let Some(installed) = preferred_installed_model(&installed_models) {
+                serve_model_override = Some(installed.clone());
             }
-        };
-
-        if resolved_model != model {
-            let mut s = status.lock().await;
-            s.detail = format!("Using installed model {}.", resolved_model);
+            {
+                let mut s = status.lock().await;
+                s.model_ready = true;
+                s.detail = "Model ready.".into();
+            }
         }
-
-        serve_model_override = Some(resolved_model.clone());
 
         // Persist only first-run/default resolution. If the user explicitly
         // configured a model, do not overwrite that choice with a temporary
         // fallback selected just to keep startup nonfatal.
         if should_persist_resolved_model(&cfg) {
-            let mut persisted = cfg.clone();
-            persisted.model = Some(resolved_model);
-            let _ = write_inference_config(&persisted);
-        }
-
-        {
-            let mut s = status.lock().await;
-            s.model_ready = true;
-            s.detail = "Model ready.".into();
+            if let Some(resolved) = serve_model_override.as_ref() {
+                let mut persisted = cfg.clone();
+                persisted.model = Some(resolved.clone());
+                let _ = write_inference_config(&persisted);
+            }
         }
     } else if cfg.kind == SourceKind::Cloud {
         // Cloud is the default inference source, but it must never block the
@@ -3786,13 +3777,13 @@ mod tests {
     }
 
     #[test]
-    fn default_local_model_picks_second_largest_that_fits() {
+    fn default_local_model_picks_smallest_that_fits() {
         // QWEN35_MODELS min_ram ladder: 4,6,8,12,24,32,96 GB
         assert_eq!(default_local_model(4.0), "qwen3.5:0.8b");  // only one fits
-        assert_eq!(default_local_model(8.0), "qwen3.5:2b");    // fits 0.8/2/4 → 2nd-largest
-        assert_eq!(default_local_model(16.0), "qwen3.5:4b");   // fits ..9b → 2nd-largest
-        assert_eq!(default_local_model(32.0), "qwen3.5:27b");  // fits 0.8/2/4/9/27/35b → 2nd-largest is 27b
-        assert_eq!(default_local_model(128.0), "qwen3.5:35b"); // fits all → 2nd-largest
+        assert_eq!(default_local_model(8.0), "qwen3.5:0.8b");  // smallest that fits
+        assert_eq!(default_local_model(16.0), "qwen3.5:0.8b"); // smallest that fits
+        assert_eq!(default_local_model(32.0), "qwen3.5:0.8b"); // smallest that fits
+        assert_eq!(default_local_model(128.0), "qwen3.5:0.8b"); // smallest that fits
     }
 
     #[test]
@@ -3930,10 +3921,10 @@ mod tests {
         let cfg = InferenceConfig { kind: SourceKind::Ollama, ..Default::default() };
         let plan = boot_plan(&cfg, 16.0);
         assert!(plan.launch_ollama);
-        assert_eq!(plan.model_to_pull.as_deref(), Some("qwen3.5:4b"));
+        assert_eq!(plan.model_to_pull.as_deref(), Some("qwen3.5:0.8b"));
         assert!(plan.engine_host.is_none());
         assert!(plan.serve_args.windows(2).any(|w| w == ["--engine", "ollama"]));
-        assert!(plan.serve_args.windows(2).any(|w| w == ["--model", "qwen3.5:4b"]));
+        assert!(plan.serve_args.windows(2).any(|w| w == ["--model", "qwen3.5:0.8b"]));
     }
 
     #[test]
